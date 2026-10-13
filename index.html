@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Prison Escape — videojuego de sigilo 3D con Three.js. Escapa de la prisión evitando los reflectores y guardias." />
+  <title>Prison Escape 3D</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+
+  <!-- ═══════════════ CANVAS THREE.JS ═══════════════ -->
+  <canvas id="game-canvas"></canvas>
+
+  <!-- ═══════════════ PANTALLA DE CARGA ═══════════════ -->
+  <div id="loading-screen">
+    <div class="loading-logo">PRISON<span>ESCAPE</span></div>
+    <div id="loading-label">Iniciando motor 3D...</div>
+    <div id="loading-bar-track">
+      <div id="loading-bar-fill"></div>
+    </div>
+    <div id="loading-error"></div>
+  </div>
+
+  <!-- ═══════════════ OVERLAY DE INICIO ════════════════ -->
+  <div id="start-overlay" style="display:none;">
+    <div class="ol-tag">THREE.JS · WEBGL · GLSL</div>
+    <h1 id="ol-title">PRISON<br><span>ESCAPE</span></h1>
+    <p class="ol-sub">SIGILO · SUPERVIVENCIA · FUGA</p>
+
+    <div class="ol-controls-grid">
+      <div class="ol-ctrl"><span class="key">W A S D</span> Movimiento</div>
+      <div class="ol-ctrl"><span class="key">Mouse</span> Cámara orbital</div>
+      <div class="ol-ctrl"><span class="key">C</span> Agacharse / Erguirse</div>
+      <div class="ol-ctrl"><span class="key">F</span> Activar camuflaje</div>
+      <div class="ol-ctrl"><span class="key">E</span> Interactuar / Recoger</div>
+      <div class="ol-ctrl"><span class="key">Esc</span> Liberar mouse</div>
+    </div>
+
+    <div class="ol-routes">
+      <div class="route-card">
+        <div class="route-icon">💣</div>
+        <div><strong>Ruta A — Demolición</strong><br>Encuentra la bomba, colócala en la compuerta y huye.</div>
+      </div>
+      <div class="route-card">
+        <div class="route-icon">🗝️</div>
+        <div><strong>Ruta B — Sigilo</strong><br>Abate al guardia por la espalda, toma la llave y escapa.</div>
+      </div>
+    </div>
+
+    <button id="start-btn">INICIAR FUGA</button>
+  </div>
+
+  <!-- ═══════════════ HUD (POINTER-EVENTS: NONE) ════════════════ -->
+  <div id="hud">
+
+    <!-- Mira central -->
+    <div id="crosshair"><div class="ch-dot"></div></div>
+
+    <!-- Barra de estado (arriba centro) -->
+    <div id="status-bar" class="stealth">● SIGILO ACTIVO</div>
+
+    <!-- Objetivo del jugador -->
+    <div id="objective-panel">
+      <div class="objective-label">OBJETIVO</div>
+      <div id="objective-text">Busca la bomba o roba la llave a un guardia</div>
+    </div>
+
+    <!-- Prompt de interacción (centro inferior) -->
+    <div id="interaction-prompt"></div>
+
+    <!-- Mensaje de juego flotante -->
+    <div id="game-message"></div>
+
+    <!-- Inventario del jugador (arriba derecha) -->
+    <div id="inventory-panel">
+      <div class="inv-label">INVENTARIO</div>
+      <div id="inventory"></div>
+    </div>
+
+    <!-- Panel de controles (abajo izquierda) -->
+    <div id="controls-panel">
+      <span class="ck">WASD</span> Mover &nbsp;|&nbsp;
+      <span class="ck">C</span> Agachar &nbsp;|&nbsp;
+      <span class="ck">F</span> Camuflaje &nbsp;|&nbsp;
+      <span class="ck">E</span> Interactuar
+    </div>
+
+    <!-- Debug (abajo derecha) -->
+    <div id="debug-info"></div>
+
+    <!-- ─── UI DE COLOCACIÓN DE BOMBA ─── -->
+    <div id="bomb-place-ui" style="display:none;">
+      <div class="bp-label">⚡ COLOCANDO BOMBA — Mantén [ E ]</div>
+      <div id="bomb-progress-track"><div id="bomb-progress-fill"></div></div>
+    </div>
+
+    <!-- ─── CUENTA ATRÁS DE DETONACIÓN ─── -->
+    <div id="bomb-countdown" style="display:none;">
+      <div class="bcd-label">💣 DETONACIÓN EN</div>
+      <div id="bomb-count-num">5</div>
+      <div class="bcd-sub">ALÉJATE</div>
+    </div>
+
+  </div><!-- /hud -->
+
+  <!-- ═══════════════ FLASH DE ALERTA ═══════════════ -->
+  <div id="alert-flash"></div>
+
+  <!-- ═══════════════ AVISO POINTER LOCK ═══════════════ -->
+  <div id="lock-notice">
+    Clic en la pantalla para retomar el control del mouse
+  </div>
+
+  <!-- ═══════════════ MODAL DE INTERROGATORIO ════════════ -->
+  <div id="interrogation-modal" style="display:none;">
+    <div class="im-header">
+      <div class="im-siren">🚨</div>
+      <div class="im-title">ALTO — MANOS ARRIBA</div>
+      <div class="im-siren">🚨</div>
+    </div>
+    <p class="im-guard-text">
+      "¡No te muevas! Antes de disparar, responde esta pregunta.<br>
+      Tienes <span id="trivia-timer" class="timer-red">10</span> segundos."
+    </p>
+    <div id="trivia-question"></div>
+    <div id="trivia-options"></div>
+  </div>
+
+  <!-- ═══════════════ GAME OVER ════════════════ -->
+  <div id="gameover-screen" style="display:none;">
+    <div class="end-icon">☠</div>
+    <h2 class="end-title red">HAS SIDO EJECUTADO</h2>
+    <p class="end-sub">Los guardias identificaron la farsa.<br>No hubo segunda oportunidad.</p>
+    <button id="restart-btn" class="end-btn">VOLVER A INTENTAR</button>
+  </div>
+
+  <!-- ═══════════════ VICTORIA ════════════════ -->
+  <div id="victory-screen" style="display:none;">
+    <div class="end-icon gold">★</div>
+    <h2 class="end-title gold">¡FUGA EXITOSA!</h2>
+    <p id="victory-message" class="end-sub"></p>
+    <button id="restart-victory-btn" class="end-btn gold">JUGAR DE NUEVO</button>
+  </div>
+
+  <!-- ═══════════════ SCRIPT PRINCIPAL ════════════════ -->
+  <script type="module" src="js/main.js"></script>
+
+</body>
+</html>
