@@ -114,6 +114,7 @@ let mouseLocked = false;
 let isCrouching   = false;
 let isCamouflaged = false;
 let hasCamoItem   = false;
+let camoBagMesh   = null;
 let hasBomb       = false;
 let hasKey        = false;
 
@@ -124,11 +125,14 @@ let guards = [];
 let spotRigs = [];
 /** @type {THREE.Box3[]} Cajas de colisión estáticas del mundo */
 let staticColliders = [];
+/** Colliders que también bloquean la visión de guardias y reflectores. */
+let visionOccluders = [];
 /** @type {Array<Object>} Ítems interactuables en el mundo */
 let worldItems = [];
 
 // — Timers —
 let graceTimer    = 0;
+let hasUsedRevive = false;
 let triviaTimer   = 0;
 let triviaInterval = null;
 let activeTriviaQ  = null;
@@ -140,6 +144,7 @@ let bombPlaceProgress = 0;  // 0 → 3 s (se llena mientras el jugador mantiene 
 let bombPlanted       = false;
 let bombFuseInterval  = null;
 let bombPulseLight    = null;  // PointLight roja parpadeante de la bomba en el suelo
+let bombMesh          = null;
 
 // — Compuerta —
 let gateOpen = false;
@@ -219,7 +224,12 @@ function buildEnvironment() {
   }
 
   const hw = COURT.W / 2, hd = COURT.D / 2;
-  addWall(0,  WALL.H / 2, -hd,  COURT.W + WALL.T * 2, WALL.H, WALL.T); // Norte
+  // Norte: dejar una abertura real para la compuerta de escape.
+  const northSideWidth = (COURT.W - GATE_W) / 2;
+  const northSideOffset = GATE_W / 2 + northSideWidth / 2;
+  addWall(-northSideOffset, WALL.H / 2, -hd, northSideWidth, WALL.H, WALL.T);
+  addWall( northSideOffset, WALL.H / 2, -hd, northSideWidth, WALL.H, WALL.T);
+  addWall(0, WALL.H - 0.75, -hd, GATE_W, 1.5, WALL.T); // Dintel superior
   addWall(-hw, WALL.H / 2, 0,   WALL.T, WALL.H, COURT.D);               // Oeste
   addWall( hw, WALL.H / 2, 0,   WALL.T, WALL.H, COURT.D);               // Este
 
@@ -286,6 +296,32 @@ function addStaticCollider(mesh) {
   const box = new THREE.Box3().setFromObject(mesh);
   box.expandByScalar(0.05); // Margen mínimo anti-tunneling
   staticColliders.push(box);
+  visionOccluders.push(box);
+}
+
+const _visionRay = new THREE.Ray();
+const _visionHit = new THREE.Vector3();
+const _visionDir = new THREE.Vector3();
+const _visionTarget = new THREE.Vector3();
+const _visionPlayer = new THREE.Vector3();
+
+function isPlayerNearGate() {
+  const gateZ = -COURT.D / 2 + 1.5;
+  return Math.hypot(playerPos.x, playerPos.z - gateZ) < 5.5;
+}
+
+function hasClearLineOfSight(origin, target) {
+  _visionDir.subVectors(target, origin);
+  const distance = _visionDir.length();
+  if (distance <= 0.01) return true;
+  _visionDir.multiplyScalar(1 / distance);
+  _visionRay.set(origin, _visionDir);
+
+  for (const box of visionOccluders) {
+    const hit = _visionRay.intersectBox(box, _visionHit);
+    if (hit && hit.distanceTo(origin) < distance - 0.2) return false;
+  }
+  return true;
 }
 
 const _pAABB  = new THREE.Box3();
@@ -316,7 +352,9 @@ function resolveCollisions(pos) {
   const hw = COURT.W / 2 - WALL.T - PL.radius;
   const hd = COURT.D / 2 - WALL.T - PL.radius;
   pos.x = THREE.MathUtils.clamp(pos.x, -hw, hw);
-  pos.z = THREE.MathUtils.clamp(pos.z, -hd, hd);
+  const hasNorthExit = gateOpen && Math.abs(pos.x) < GATE_W / 2 - PL.radius;
+  const northLimit = hasNorthExit ? -(COURT.D / 2 + 4) : -hd;
+  pos.z = THREE.MathUtils.clamp(pos.z, northLimit, hd);
 
   // 2. Colisión AABB con obstáculos estáticos
   const ph = isCrouching ? PL.hCrouch : PL.hStand;
@@ -413,11 +451,10 @@ async function loadAllModels() {
   await setupPlayerFBX();
 
   // ── Guardias (FBX Mixamo con sistema IA de animaciones) ──────────────────────
-  await setProgress(18, 'Cargando guardia 1...');
-  await setupGuardFBX(0);
-
-  await setProgress(28, 'Cargando guardia 2...');
-  await setupGuardFBX(1);
+  for (let i = 0; i < 4; i++) {
+    await setProgress(18 + i * 5, `Cargando guardia ${i + 1}...`);
+    await setupGuardFBX(i);
+  }
 
   // ── Torres ────────────────────────────────────────────────────────────────────
   await setProgress(38, 'Cargando torre izquierda...');
@@ -541,6 +578,7 @@ async function loadAllModels() {
     });
 
     staticColliders.push(colBox);
+    visionOccluders.push(colBox);
 
     if (DEBUG_COLLIDERS) {
       // Visualizar el collider como wireframe azul para debug
@@ -795,9 +833,15 @@ async function setupGuardFBX(index) {
   }
 
   // Rutas de patrullaje: guardia 0 en oeste, guardia 1 en este
-  const sx      = index === 0 ? -14 : 14;
-  const patrolA = new THREE.Vector3(sx, 0, -22);
-  const patrolB = new THREE.Vector3(sx, 0,  22);
+  const patrolRoutes = [
+    { a: [-14, -22], b: [-14, 22] },
+    { a: [ 14,  22], b: [ 14,-22] },
+    { a: [-25,  -8], b: [ -8, -8] },
+    { a: [ 25,   8], b: [  8,  8] },
+  ];
+  const route = patrolRoutes[index % patrolRoutes.length];
+  const patrolA = new THREE.Vector3(route.a[0], 0, route.a[1]);
+  const patrolB = new THREE.Vector3(route.b[0], 0, route.b[1]);
   base.position.copy(patrolA);
 
   const coneRadius = Math.tan(GD.fov / 2) * GD.range;
@@ -865,7 +909,7 @@ function setupTower(gltf, side) {
   const model = normalizeModel(gltf.scene, WALL.H * 1.9, 0);
   model.position.set(tx, 0, tz);
   scene.add(model);
-  addStaticCollider(model);
+  // Las torres son decorativas: su malla puede ocupar el pasillo de salida.
 
   // Altura real de la torre tras normalizar
   model.updateMatrixWorld(true);
@@ -918,7 +962,13 @@ function setupGate(gltf) {
   const model = normalizeModel(gltf.scene, GATE_W, 0);
   model.position.set(0, 0, gateZ);
   scene.add(model);
-  addStaticCollider(model);
+  // Collider simple y delgado: el tamaño del asset no debe crear una pared invisible.
+  const gateCollider = new THREE.Box3(
+    new THREE.Vector3(-GATE_W / 2, 0, gateZ - 0.55),
+    new THREE.Vector3( GATE_W / 2, WALL.H, gateZ + 0.55)
+  ).expandByScalar(0.05);
+  staticColliders.push(gateCollider);
+  visionOccluders.push(gateCollider);
   // Guardamos índice para eliminar el colisionador al abrir/explotar la puerta
   gateColliderIdx = staticColliders.length - 1;
   gateMesh = model;
@@ -959,6 +1009,7 @@ function setupBombPickup(gltf) {
   // Reubicada en zona central-sur: visible desde el punto de inicio del jugador
   const pos   = new THREE.Vector3(0, 0, 18);
   const model = normalizeModel(gltf.scene, 0.7, 0);
+  bombMesh = model;
   model.position.copy(pos);
   scene.add(model);
 
@@ -992,12 +1043,25 @@ function setupBombPickup(gltf) {
 }
 
 function setupCamoPickup(gltf) {
-  const pos   = new THREE.Vector3(10, 0, 8);
+  // A pocos pasos del inicio, libre de obstáculos y fácil de reconocer.
+  const pos   = new THREE.Vector3(5, 0, 29);
   const model = normalizeModel(gltf.scene, 1.2, 0);
   model.position.copy(pos);
   scene.add(model);
 
-  worldItems.push({ type: 'camo', mesh: model, pos: pos.clone(), active: true, label: '[ E ] Recoger Camuflaje' });
+  const marker = new THREE.Mesh(
+    new THREE.TorusGeometry(0.9, 0.07, 8, 28),
+    new THREE.MeshBasicMaterial({ color: 0x66ffbb, transparent: true, opacity: 0.9 })
+  );
+  marker.rotation.x = Math.PI / 2;
+  marker.position.set(pos.x, 0.08, pos.z);
+  scene.add(marker);
+  const markerLight = new THREE.PointLight(0x55ffbb, 4, 7);
+  markerLight.position.set(pos.x, 1.2, pos.z);
+  scene.add(markerLight);
+
+  camoBagMesh = model;
+  worldItems.push({ type: 'camo', mesh: model, marker, markerLight, pos: pos.clone(), active: true, label: '[ E ] Recoger Bolsa de camuflaje' });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1116,7 +1180,7 @@ function updateGuardCone(g) {
 function checkGuardDetection(g) {
   // Gracia de inicio — los primeros segundos de juego no hay detección
   if (startupGrace > 0) return;
-  // Inmune si camuflado e inmóvil
+  // La bolsa convierte al jugador en un desecho inmóvil que los guardias ignoran.
   if (isCamouflaged && playerVelocity.lengthSq() < 0.01) return;
 
   _gFwd.set(Math.sin(g.facingAngle), 0, Math.cos(g.facingAngle));
@@ -1129,7 +1193,11 @@ function checkGuardDetection(g) {
 
   _gToPlr.normalize();
   const angle = _gFwd.angleTo(_gToPlr);
-  if (angle < GD.fov / 2) triggerAlert('guard');
+  if (angle >= GD.fov / 2) return;
+
+  const guardEye = _visionTarget.set(g.pos.x, g.pos.y + 1.45, g.pos.z);
+  _visionPlayer.copy(playerPos);
+  if (hasClearLineOfSight(guardEye, _visionPlayer)) triggerAlert('guard');
 }
 
 /**
@@ -1234,7 +1302,7 @@ function updateSpotlights(t) {
 function checkSpotDetection() {
   // Gracia de inicio — los primeros segundos de juego no hay detección
   if (startupGrace > 0) return;
-  // Inmune si camuflado e inmóvil
+  // La bolsa oculta al jugador de los reflectores mientras permanece inmóvil.
   if (isCamouflaged && playerVelocity.lengthSq() < 0.01) return;
 
   for (const rig of spotRigs) {
@@ -1247,7 +1315,8 @@ function checkSpotDetection() {
       playerPos.x - rig.target.position.x,
       playerPos.z - rig.target.position.z
     );
-    if (angle < rig.spot.angle + 0.06 && groundDist < 7) {
+    if (angle < rig.spot.angle + 0.06 && groundDist < 7 &&
+        hasClearLineOfSight(rig.spot.position, playerPos)) {
       triggerAlert('spotlight');
       return;
     }
@@ -1260,6 +1329,11 @@ function checkSpotDetection() {
 
 function triggerAlert(cause) {
   if (gs !== GS.PLAYING) return;
+  if (hasUsedRevive) {
+    showMessage('Te atraparon por segunda vez. No hay otra oportunidad.', 2500);
+    triggerGameOver();
+    return;
+  }
   gs = GS.ALERTED;
 
   // Flash de encandilamiento blanco
@@ -1321,6 +1395,7 @@ function answerTrivia(chosen) {
       '¡No disparen! ¡Soy policía! Estoy en vigilancia encubierta disfrazado de prisionero.',
       5000
     );
+    hasUsedRevive = true;
     gs = GS.GRACE;
     graceTimer = 5; // 5 segundos para buscar cobertura
     updateHUD();
@@ -1403,12 +1478,11 @@ function handleInteract() {
   if (nearest) { pickupItem(nearest); return; }
 
   // 3. Compuerta (abrirla con llave)
-  const gatePos = new THREE.Vector3(0, 0, -COURT.D / 2 + 1.5);
-  if (playerPos.distanceTo(gatePos) < 3) {
+  if (isPlayerNearGate()) {
     if (hasKey && !gateOpen) {
       openGateWithKey();
     } else if (hasBomb && !gateOpen) {
-      showMessage('Mantén [ E ] durante 3 segundos para colocar la bomba.', 2500);
+      showMessage('Estás en la zona de colocación. Mantén [ E ] durante 3 segundos.', 2500);
     } else if (!hasKey && !hasBomb) {
       showMessage('⚠ Necesitas una llave o una bomba para abrir la compuerta.', 2500);
     }
@@ -1418,6 +1492,8 @@ function handleInteract() {
 function pickupItem(item) {
   item.active = false;
   scene.remove(item.mesh);
+  if (item.marker) scene.remove(item.marker);
+  if (item.markerLight) scene.remove(item.markerLight);
 
   isInteracting = true;
   fadeToAction('agarrar', 0.2, true);
@@ -1430,7 +1506,7 @@ function pickupItem(item) {
       break;
     case 'camo':
       hasCamoItem = true;
-      showMessage('🎭 Camuflaje recogido. Agáchate (C) y pulsa F para activarlo.', 4000);
+      showMessage('Bolsa recogida. Agáchate (C), quédate quieto y pulsa F para esconderte.', 4000);
       break;
     case 'key':
       hasKey = true;
@@ -1449,8 +1525,7 @@ function updateBombPlacing(dt) {
   if (gs !== GS.PLAYING && gs !== GS.GRACE) return;
   if (!hasBomb || gateOpen || bombPlanted) return;
 
-  const gatePos = new THREE.Vector3(0, 0, -COURT.D / 2 + 1.5);
-  const near    = playerPos.distanceTo(gatePos) < 3;
+  const near    = isPlayerNearGate();
   const eHeld   = keys['KeyE'] === true;
 
   if (near && eHeld) {
@@ -1474,6 +1549,11 @@ function updateBombPlacing(dt) {
 function plantBomb() {
   hasBomb     = false;
   bombPlanted = true;
+  if (bombMesh) {
+    bombMesh.position.set(0, 0.25, -COURT.D / 2 + 1.5);
+    bombMesh.rotation.set(0, 0, 0);
+    scene.add(bombMesh);
+  }
   updateHUD();
 
   $('bomb-countdown').style.display = 'flex';
@@ -1506,10 +1586,14 @@ function detonateGate() {
     }, 380);
   }
 
+  if (bombMesh) { scene.remove(bombMesh); bombMesh = null; }
+
   // Eliminar la puerta de la escena y su colisionador
   if (gateMesh) { scene.remove(gateMesh); gateMesh = null; }
   if (gateColliderIdx >= 0) {
-    staticColliders.splice(gateColliderIdx, 1);
+    const [removedCollider] = staticColliders.splice(gateColliderIdx, 1);
+    const occluderIndex = visionOccluders.indexOf(removedCollider);
+    if (occluderIndex >= 0) visionOccluders.splice(occluderIndex, 1);
     gateColliderIdx = -1;
   }
   gateOpen = true;
@@ -1534,7 +1618,9 @@ function openGateWithKey() {
         scene.remove(gateMesh);
         gateMesh = null;
         if (gateColliderIdx >= 0) {
-          staticColliders.splice(gateColliderIdx, 1);
+          const [removedCollider] = staticColliders.splice(gateColliderIdx, 1);
+          const occluderIndex = visionOccluders.indexOf(removedCollider);
+          if (occluderIndex >= 0) visionOccluders.splice(occluderIndex, 1);
           gateColliderIdx = -1;
         }
       }
@@ -1582,12 +1668,25 @@ function updateDebris(dt) {
 
 function toggleCamouflage() {
   if (!hasCamoItem) { showMessage('No tienes equipo de camuflaje.', 2000); return; }
+  if (isCamouflaged) { showMessage('Quédate quieto bajo la bolsa; muévete para salir.', 2200); return; }
   if (!isCrouching) { showMessage('Agáchate primero (C) para activar el camuflaje.', 2200); return; }
-  isCamouflaged = !isCamouflaged;
+  if (playerVelocity.lengthSq() > 0.01 || isJumping) {
+    showMessage('Quédate quieto para cubrirte con la bolsa.', 2200);
+    return;
+  }
+  isCamouflaged = true;
+  hasCamoItem = false;
+  if (camoBagMesh) {
+    camoBagMesh.position.set(playerPos.x, getGroundHeight(playerPos), playerPos.z);
+    camoBagMesh.rotation.y = playerMesh?.rotation.y ?? 0;
+    camoBagMesh.visible = true;
+    scene.add(camoBagMesh);
+  }
+  if (playerMesh) playerMesh.visible = false;
   showMessage(
     isCamouflaged
-      ? '🎭 Camuflaje ACTIVADO — Permanece completamente inmóvil para que los reflectores no te detecten.'
-      : '🎭 Camuflaje DESACTIVADO.',
+      ? 'Te escondiste bajo la bolsa. Si te mueves, revelarás tu posición y la perderás.'
+      : 'La bolsa ya no te cubre.',
     isCamouflaged ? 4000 : 2000
   );
   updateHUD();
@@ -1603,7 +1702,7 @@ function updateHUD() {
   if (inv) {
     let html = '';
     if (hasBomb)    html += '<span class="inv-item" title="Bomba">💣</span>';
-    if (hasCamoItem) html += '<span class="inv-item" title="Camuflaje">🎭</span>';
+    if (hasCamoItem) html += '<span class="inv-item" title="Bolsa de camuflaje">🛍️</span>';
     if (hasKey)     html += '<span class="inv-item" title="Llave">🗝️</span>';
     if (bombPlanted) html += '<span class="inv-item blink-red" title="Bomba activa">💣 ACTIVA</span>';
     inv.innerHTML = html;
@@ -1648,8 +1747,7 @@ function updateInteractionPrompt() {
 
   // Prioridad 3: Compuerta
   if (!prompt) {
-    const gatePos = new THREE.Vector3(0, 0, -COURT.D / 2 + 1.5);
-    if (playerPos.distanceTo(gatePos) < 3) {
+    if (isPlayerNearGate()) {
       if (hasKey && !gateOpen)    prompt = '[ E ] Abrir Compuerta';
       else if (hasBomb && !gateOpen) prompt = 'Mantén [ E ] — Colocar Bomba';
       else if (gateOpen)          prompt = '▶ ¡Cruza y escapa!';
@@ -1687,10 +1785,8 @@ function setupInput() {
 
     // Toggle agachado
     if (e.code === 'KeyC' || e.code === 'ControlLeft') {
-      if (!isJumping) {
+      if (!isJumping && !isCamouflaged) {
         isCrouching = !isCrouching;
-        // Erguirse desactiva el camuflaje
-        if (!isCrouching && isCamouflaged) { isCamouflaged = false; }
         updateHUD();
       }
     }
@@ -1801,10 +1897,11 @@ function animate() {
       playerPos.x += _mv.x;
       playerPos.z += _mv.z;
 
-      // Moverse cancela el camuflaje
       if (isCamouflaged) {
         isCamouflaged = false;
-        showMessage('⚠ Te moviste — camuflaje perdido.', 1800);
+        hasCamoItem = false;
+        if (playerMesh) playerMesh.visible = true;
+        showMessage('Te moviste y saliste de la bolsa. El camuflaje se perdió.', 2200);
         updateHUD();
       }
     }
@@ -1967,6 +2064,8 @@ async function init() {
 
   try {
     await loadAllModels();
+    // La barra tiene una transición CSS; esperar a que llegue visualmente al 100%.
+    await new Promise(resolve => setTimeout(resolve, 450));
     $('loading-screen').style.display = 'none';
     $('start-overlay').style.display  = 'flex';
     console.log('[PrisonEscape] Carga completa. Colisionadores:', staticColliders.length);
