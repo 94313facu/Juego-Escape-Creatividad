@@ -15,6 +15,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader  } from 'three/addons/loaders/FBXLoader.js';
+import { MusicManager } from './music.js';
+import { SoundEffects } from './sound-effects.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §1 · CONSTANTES
@@ -82,6 +84,8 @@ const TRIVIA = [
 
 let gs = GS.LOADING;            // Estado actual del juego
 let scene, renderer, camera, clock;
+const music = new MusicManager();
+const soundEffects = new SoundEffects();
 
 // — Jugador —
 let playerMesh  = null;
@@ -1335,6 +1339,8 @@ function triggerAlert(cause) {
     return;
   }
   gs = GS.ALERTED;
+  music.play('alert', { loop: false, fadeMs: 200 });
+  soundEffects.play('alert');
 
   // Flash de encandilamiento blanco
   const flash = $('alert-flash');
@@ -1352,6 +1358,7 @@ function triggerAlert(cause) {
 function startInterrogation() {
   if (gs !== GS.ALERTED) return;
   gs = GS.INTERROGATION;
+  music.play('interrogation');
 
   const q = TRIVIA[Math.floor(Math.random() * TRIVIA.length)];
   activeTriviaQ = q;
@@ -1397,6 +1404,7 @@ function answerTrivia(chosen) {
     );
     hasUsedRevive = true;
     gs = GS.GRACE;
+    music.play('grace', { loop: false, fadeMs: 400 });
     graceTimer = 5; // 5 segundos para buscar cobertura
     updateHUD();
   } else {
@@ -1412,6 +1420,8 @@ function answerTrivia(chosen) {
 function triggerGameOver() {
   if (gs === GS.GAMEOVER) return;
   gs = GS.GAMEOVER;
+  music.play('gameover', { loop: false, fadeMs: 500 });
+  soundEffects.play('capture');
   isDead = true;
   fadeToAction('morir', 0.1, true); // Transición rápida a morir
 
@@ -1430,6 +1440,7 @@ function triggerGameOver() {
 function triggerVictory(route) {
   if (gs === GS.VICTORY) return;
   gs = GS.VICTORY;
+  music.play(route === 'bomb' ? 'victoryBomb' : 'victoryStealth', { loop: false, fadeMs: 700 });
   const msg = $('victory-message');
   if (msg) {
     msg.textContent = route === 'bomb'
@@ -1491,6 +1502,7 @@ function handleInteract() {
 
 function pickupItem(item) {
   item.active = false;
+  soundEffects.play('pickup');
   scene.remove(item.mesh);
   if (item.marker) scene.remove(item.marker);
   if (item.markerLight) scene.remove(item.markerLight);
@@ -1549,6 +1561,7 @@ function updateBombPlacing(dt) {
 function plantBomb() {
   hasBomb     = false;
   bombPlanted = true;
+  soundEffects.play('bombPlant');
   if (bombMesh) {
     bombMesh.position.set(0, 0.25, -COURT.D / 2 + 1.5);
     bombMesh.rotation.set(0, 0, 0);
@@ -1568,11 +1581,14 @@ function plantBomb() {
     if (t <= 0) {
       clearInterval(bombFuseInterval);
       detonateGate();
+    } else {
+      soundEffects.play('countdown');
     }
   }, 1000);
 }
 
 function detonateGate() {
+  soundEffects.play('bombExplosion');
   $('bomb-countdown').style.display = 'none';
 
   // Flash de explosión dorado
@@ -1604,6 +1620,7 @@ function detonateGate() {
 }
 
 function openGateWithKey() {
+  soundEffects.play('gateOpen');
   // Animación de apertura: rotar la puerta
   if (gateMesh) {
     const startAngle  = gateMesh.rotation.y;
@@ -1837,6 +1854,7 @@ function setupInput() {
   $('start-btn')?.addEventListener('click', () => {
     $('start-overlay').style.display = 'none';
     gs = GS.PLAYING;
+    music.play('ambient');
     // Reiniciar reloj para que t=0 al comenzar (evita sweep aleatorio al inicio)
     clock.stop();
     clock.start();
@@ -1844,6 +1862,10 @@ function setupInput() {
     startupGrace = 5;
     renderer.domElement.requestPointerLock();
     updateHUD();
+  });
+
+  $('music-toggle')?.addEventListener('click', event => {
+    music.toggleMute(event.currentTarget);
   });
 
   $('restart-btn')?.addEventListener('click',         () => location.reload());
@@ -2025,6 +2047,7 @@ function animate() {
     graceTimer -= dt;
     if (graceTimer <= 0) {
       gs = GS.PLAYING;
+      music.play('ambient');
     }
     updateHUD();
   }

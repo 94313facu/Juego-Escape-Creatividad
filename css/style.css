@@ -153,6 +153,16 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
   pointer-events: none;
 }
 
+#music-toggle {
+  position: fixed; z-index: 250; top: 16px; left: 16px;
+  width: 42px; height: 42px;
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 3px; background: rgba(0,0,0,0.55);
+  color: rgba(255,255,255,0.8); font-size: 22px;
+  cursor: pointer; pointer-events: auto;
+}
+#music-toggle:hover { border-color: var(--yellow); color: var(--yellow); }
+
 /* Mira */
 #crosshair {
   position: absolute; top: 50%; left: 50%;
