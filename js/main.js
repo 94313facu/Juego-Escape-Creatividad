@@ -15,6 +15,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader  } from 'three/addons/loaders/FBXLoader.js';
+import { Sky } from 'three/addons/objects/Sky.js';
 import { MusicManager } from './music.js';
 import { SoundEffects } from './sound-effects.js';
 
@@ -157,6 +158,9 @@ let gateColliderIdx = -1; // Índice en staticColliders para eliminarla al explo
 
 // — Partículas de explosión —
 let debrisParticles = [];
+let skyClouds       = null; // Capa de nubes (se desplaza lentamente)
+let timedEffects    = []; // Efectos con update(dt) → false cuando terminan (explosión)
+let cameraShake     = 0;  // Segundos de sacudida de cámara restantes
 
 // — Timers internos —
 let msgTimeout = null;
@@ -168,6 +172,51 @@ const $ = id => document.getElementById(id);
 // §3 · RENDERER, SCENE, CAMERA
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Cielo abierto: modelo atmosférico de Three.js (dispersión de Rayleigh/Mie)
+ * con el sol alto de media mañana, más una capa de nubes procedural.
+ */
+function buildSky() {
+  const sky = new Sky();
+  sky.scale.setScalar(250); // Dentro del plano lejano de la cámara (300)
+  const u = sky.material.uniforms;
+  u.turbidity.value = 2.5;
+  u.rayleigh.value = 3;
+  u.mieCoefficient.value = 0.005;
+  u.mieDirectionalG.value = 0.8;
+  const sun = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 35), THREE.MathUtils.degToRad(150));
+  u.sunPosition.value.copy(sun);
+  scene.add(sky);
+
+  // Nubes: textura de ruido suave pintada en canvas sobre una cúpula plana alta
+  const c = document.createElement('canvas');
+  c.width = c.height = 512;
+  const ctx = c.getContext('2d');
+  for (let i = 0; i < 90; i++) {
+    const x = Math.random() * 512, y = Math.random() * 512, r = 20 + Math.random() * 60;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, 'rgba(255,255,255,0.22)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    // Repetir en los bordes para que la textura sea continua al repetirse
+    for (const ox of [-512, 0, 512]) for (const oy of [-512, 0, 512]) {
+      ctx.save(); ctx.translate(ox, oy); ctx.fillRect(x - r, y - r, r * 2, r * 2); ctx.restore();
+    }
+  }
+  const cloudTex = new THREE.CanvasTexture(c);
+  cloudTex.wrapS = cloudTex.wrapT = THREE.RepeatWrapping;
+  cloudTex.repeat.set(3, 3);
+  const clouds = new THREE.Mesh(
+    new THREE.CircleGeometry(240, 48),
+    // alphaMap radial: las nubes se desvanecen hacia el borde de la cúpula (sin corte en el horizonte)
+    new THREE.MeshBasicMaterial({ map: cloudTex, alphaMap: getLightPoolTexture(), transparent: true, depthWrite: false, fog: false, side: THREE.DoubleSide })
+  );
+  clouds.rotation.x = Math.PI / 2;
+  clouds.position.y = 90;
+  scene.add(clouds);
+  skyClouds = clouds;
+}
+
 function setupThree() {
   renderer = new THREE.WebGLRenderer({ canvas: $('game-canvas'), antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -178,9 +227,10 @@ function setupThree() {
   renderer.toneMappingExposure = 0.9;
 
   scene = new THREE.Scene();
-  // Amanecer nublado: gris ceniza frío — máxima legibilidad
+  // Color de respaldo; el cielo real lo dibuja buildSky()
   scene.background = new THREE.Color(0xb0b8c0);
-  scene.fog        = new THREE.FogExp2(0xb0b8c0, 0.015);
+  scene.fog        = new THREE.FogExp2(0xb7c3cf, 0.012);
+  buildSky();
 
   camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.1, 300);
   clock  = new THREE.Clock();
@@ -196,27 +246,292 @@ function setupThree() {
 // §4 · ENTORNO — SUELO, MUROS, ILUMINACIÓN
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Textura de concreto: "Dirty leaking concrete wall" de Оrрндп ЯТG (Sketchfab, CC-BY-4.0)
+let concreteTexture = null;
+function getConcreteTexture() {
+  if (!concreteTexture) {
+    concreteTexture = new THREE.TextureLoader().load('./models/textures/concrete_wall.jpg');
+    concreteTexture.colorSpace = THREE.SRGBColorSpace;
+    concreteTexture.wrapS = concreteTexture.wrapT = THREE.RepeatWrapping;
+    concreteTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  }
+  return concreteTexture;
+}
+
+/**
+ * BoxGeometry con UVs escaladas a tamaño real: la textura se repite cada `tile`
+ * unidades en todas las caras, sin estirarse en muros largos.
+ */
+function tiledBox(w, h, d, tile) {
+  const geo = new THREE.BoxGeometry(w, h, d);
+  const uv = geo.attributes.uv;
+  // Orden de caras de BoxGeometry: +x, -x, +y, -y, +z, -z (4 vértices cada una)
+  const faceDims = [[d, h], [d, h], [w, d], [w, d], [w, h], [w, h]];
+  for (let f = 0; f < 6; f++) {
+    const [fu, fv] = faceDims[f];
+    for (let i = f * 4; i < f * 4 + 4; i++) {
+      uv.setXY(i, uv.getX(i) * fu / tile, uv.getY(i) * fv / tile);
+    }
+  }
+  return geo;
+}
+
+// Zonas del patio decoradas con props (ver loadYardProps)
+const COURT_ZONE = { x0: -33.5, x1: -20, z0: 17.5, z1: 32.5 }; // Cancha de básquet (oeste, aro contra la pared)
+const PEN_ZONE   = { x0:  21, x1:  33, z0: 17, z1: 33 }; // Depósito enrejado (este)
+
+/** Líneas pintadas en el piso: zona restringida frente a la compuerta y cancha. */
+function buildFloorMarkings() {
+  const yellow = new THREE.MeshBasicMaterial({ color: 0xc9a227, transparent: true, opacity: 0.8 });
+  const white  = new THREE.MeshBasicMaterial({ color: 0xd8d8d0, transparent: true, opacity: 0.7 });
+
+  // Franja horizontal de ancho `t` entre dos puntos del piso
+  function stripe(x1, z1, x2, z2, t, mat) {
+    const len = Math.hypot(x2 - x1, z2 - z1);
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(len, t), mat);
+    m.rotation.order = 'YXZ';
+    m.rotation.y = -Math.atan2(z2 - z1, x2 - x1);
+    m.rotation.x = -Math.PI / 2;
+    m.position.set((x1 + x2) / 2, 0.02, (z1 + z2) / 2);
+    scene.add(m);
+  }
+
+  // Línea amarilla de zona restringida delante de la pared norte
+  const zr = -COURT.D / 2 + 9;
+  stripe(-COURT.W / 2 + 2, zr, COURT.W / 2 - 2, zr, 0.35, yellow);
+  for (let x = -COURT.W / 2 + 4; x < COURT.W / 2 - 2; x += 4) {
+    stripe(x, zr + 0.6, x + 1.6, zr + 1.6, 0.25, yellow); // Rayado de advertencia
+  }
+
+  // Media cancha de básquet: el aro está contra la pared oeste mirando al centro (+X)
+  const c = COURT_ZONE;
+  const cz = (c.z0 + c.z1) / 2;
+  const ft = c.x0 + 6; // Línea de tiro libre
+  stripe(c.x0, c.z0, c.x1, c.z0, 0.12, white);                 // Laterales
+  stripe(c.x0, c.z1, c.x1, c.z1, 0.12, white);
+  stripe(c.x1, c.z0, c.x1, c.z1, 0.12, white);                 // Mitad de cancha
+  stripe(c.x0, cz - 2.5, ft, cz - 2.5, 0.12, white);           // Área (la "pintura")
+  stripe(c.x0, cz + 2.5, ft, cz + 2.5, 0.12, white);
+  stripe(ft, cz - 2.5, ft, cz + 2.5, 0.12, white);
+  const paint = new THREE.Mesh(new THREE.PlaneGeometry(6, 5), new THREE.MeshBasicMaterial({ color: 0x7a2e22, transparent: true, opacity: 0.35 }));
+  paint.rotation.x = -Math.PI / 2;
+  paint.position.set(c.x0 + 3, 0.015, cz);
+  scene.add(paint);
+  // Semicírculo de tiro libre y línea de triple (abren hacia el centro del patio)
+  const arc = (r, x) => {
+    const m = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.12, 48, 1, -Math.PI / 2, Math.PI), white);
+    m.rotation.x = -Math.PI / 2;
+    m.position.set(x, 0.02, cz);
+    scene.add(m);
+  };
+  arc(2.4, ft);
+  arc(6.3, c.x0 + 1.5);
+  stripe(c.x1 - 0.06, cz - 3, c.x1 - 0.06, cz + 3, 0.12, white); // Marca de medio campo
+}
+
+/** Espiral a lo largo de un segmento recto: el rollo de concertina. */
+class CoilCurve extends THREE.Curve {
+  constructor(a, b, radius, pitch) {
+    super();
+    this.a = a; this.b = b; this.radius = radius;
+    this.dir = new THREE.Vector3().subVectors(b, a);
+    this.turns = this.dir.length() / pitch;
+    this.dir.normalize();
+    // Base ortonormal perpendicular al segmento (horizontal + vertical)
+    this.side = new THREE.Vector3(-this.dir.z, 0, this.dir.x);
+    this.up = new THREE.Vector3(0, 1, 0);
+  }
+  getPoint(t, out = new THREE.Vector3()) {
+    const ang = t * this.turns * Math.PI * 2;
+    return out.copy(this.a).lerp(this.b, t)
+      .addScaledVector(this.side, Math.cos(ang) * this.radius)
+      .addScaledVector(this.up, Math.sin(ang) * this.radius);
+  }
+}
+
+/** Textura de ruido de color (canvas) para pasto y tierra. */
+function noiseTexture(base, spread, repeat) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * spread;
+    img.data[i] = base[0] + n; img.data[i + 1] = base[1] + n; img.data[i + 2] = base[2] + n * 0.6;
+    img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(repeat, repeat);
+  return tex;
+}
+
+/**
+ * Exterior de la cárcel, visible al abrir la compuerta norte: campo abierto,
+ * un camino de tierra que se aleja hacia el horizonte, árboles y colinas.
+ * Es sólo decorado: sin colliders, no traba nada del juego.
+ */
+function buildOutsideScenery() {
+  // Campo de pasto seco alrededor de todo el penal (el piso del patio lo tapa adentro)
+  const field = new THREE.Mesh(
+    new THREE.PlaneGeometry(600, 600),
+    new THREE.MeshStandardMaterial({ map: noiseTexture([92, 104, 62], 40, 120), roughness: 1 })
+  );
+  field.rotation.x = -Math.PI / 2;
+  field.position.y = -0.05;
+  field.receiveShadow = true;
+  scene.add(field);
+
+  // Camino de tierra: sale de la compuerta, se aleja y dobla suave hacia el horizonte
+  const gateZ = -COURT.D / 2;
+  const path = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 0, gateZ),
+    new THREE.Vector3(0, 0, gateZ - 25),
+    new THREE.Vector3(8, 0, gateZ - 60),
+    new THREE.Vector3(-6, 0, gateZ - 110),
+    new THREE.Vector3(10, 0, gateZ - 180),
+  ]);
+  const ROAD_W = GATE_W - 1;
+  const SEGS = 160;
+  const pos = [], uv = [], idx = [];
+  const p = new THREE.Vector3(), tan = new THREE.Vector3(), side = new THREE.Vector3();
+  for (let i = 0; i <= SEGS; i++) {
+    const t = i / SEGS;
+    path.getPointAt(t, p);
+    path.getTangentAt(t, tan);
+    side.set(-tan.z, 0, tan.x).normalize();
+    const w = ROAD_W / 2 * (1 + t * 0.3); // Se ensancha un poco a lo lejos
+    pos.push(p.x - side.x * w, 0.01, p.z - side.z * w, p.x + side.x * w, 0.01, p.z + side.z * w);
+    uv.push(0, t * 40, 1, t * 40);
+    if (i < SEGS) { const k = i * 2; idx.push(k, k + 1, k + 2, k + 1, k + 3, k + 2); }
+  }
+  const roadGeo = new THREE.BufferGeometry();
+  roadGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  roadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  roadGeo.setIndex(idx);
+  roadGeo.computeVertexNormals();
+  const road = new THREE.Mesh(roadGeo, new THREE.MeshStandardMaterial({
+    map: noiseTexture([120, 98, 72], 50, 1), roughness: 1,
+  }));
+  road.material.map.repeat.set(1, 1);
+  road.receiveShadow = true;
+  scene.add(road);
+
+  // Árboles low-poly a los costados del camino (tronco + copa), alejados del penal
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3524, roughness: 1 });
+  const leafMats = [0x2f4a26, 0x3b5a2c, 0x27401f].map(c => new THREE.MeshStandardMaterial({ color: c, roughness: 1, flatShading: true }));
+  const trunkGeo = new THREE.CylinderGeometry(0.25, 0.35, 2.4, 6);
+  const leafGeo = new THREE.ConeGeometry(1.8, 5, 7);
+  for (let i = 0; i < 70; i++) {
+    const t = 0.12 + Math.random() * 0.88;
+    path.getPointAt(t, p);
+    path.getTangentAt(t, tan);
+    side.set(-tan.z, 0, tan.x).normalize();
+    const off = (Math.random() < 0.5 ? -1 : 1) * (ROAD_W / 2 + 3 + Math.random() * 30);
+    const x = p.x + side.x * off, z = p.z + side.z * off;
+    if (z > gateZ - 12) continue; // Nada pegado al muro
+    const k = 0.8 + Math.random() * 0.8;
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.position.set(x, 1.2 * k, z);
+    trunk.scale.setScalar(k);
+    const leaves = new THREE.Mesh(leafGeo, leafMats[i % 3]);
+    leaves.position.set(x, (2.4 + 2.2) * k, z);
+    leaves.scale.setScalar(k);
+    leaves.castShadow = true;
+    scene.add(trunk, leaves);
+  }
+
+  // Colinas lejanas que cierran el horizonte (se funden con la niebla)
+  const hillMat = new THREE.MeshStandardMaterial({ color: 0x4f6340, roughness: 1, flatShading: true });
+  for (let i = 0; i < 9; i++) {
+    const hill = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), hillMat);
+    const a = -Math.PI / 2 + (i - 4) * 0.28;
+    hill.position.set(Math.cos(a) * 190, -1, Math.sin(a) * 190 + gateZ);
+    hill.scale.set(35 + Math.random() * 30, 12 + Math.random() * 14, 25);
+    scene.add(hill);
+  }
+}
+
+/** Alambre de púas en concertina sobre todo el perímetro del muro. */
+function buildRazorWire() {
+  const wireMat = new THREE.MeshStandardMaterial({ color: 0x9aa0a6, metalness: 0.85, roughness: 0.35 });
+  const postMat = new THREE.MeshStandardMaterial({ color: 0x3a3d42, metalness: 0.6, roughness: 0.6 });
+  const R = 0.55;                          // Radio del rollo
+  const y = WALL.H + 0.3 + R + 0.15;       // Apoyado sobre el remate del muro
+  const hw = COURT.W / 2, hd = COURT.D / 2;
+  const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
+
+  for (let i = 0; i < 4; i++) {
+    const [x1, z1] = corners[i], [x2, z2] = corners[(i + 1) % 4];
+    const a = new THREE.Vector3(x1, y, z1), b = new THREE.Vector3(x2, y, z2);
+    const coil = new CoilCurve(a, b, R, 0.42);
+    const tube = new THREE.Mesh(
+      new THREE.TubeGeometry(coil, Math.ceil(coil.turns * 10), 0.03, 4, false), wireMat);
+    tube.castShadow = true;
+    scene.add(tube);
+
+    // Dos hilos tensores rectos a los costados del rollo
+    const len = a.distanceTo(b);
+    for (const off of [-R, R]) {
+      const line = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, len, 4), wireMat);
+      line.position.copy(a).lerp(b, 0.5).addScaledVector(coil.side, off).setY(y - R * 0.6);
+      line.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), coil.dir);
+      scene.add(line);
+    }
+
+    // Soportes en "Y" cada 5 unidades
+    const posts = Math.round(len / 5);
+    for (let k = 0; k <= posts; k++) {
+      const p = new THREE.Vector3().copy(a).lerp(b, k / posts);
+      for (const sgn of [-1, 1]) {
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.06, R * 2.4, 0.06), postMat);
+        arm.position.copy(p).addScaledVector(coil.side, sgn * R * 0.5).setY(WALL.H + 0.3 + R * 1.1);
+        arm.rotateOnWorldAxis(coil.dir, -sgn * 0.45);
+        scene.add(arm);
+      }
+    }
+  }
+}
+
 function buildEnvironment() {
-  // ─── Suelo: concreto húmedo (roughness bajo para reflejar luces) ───────────
+  // ─── Suelo: losas de concreto agrietado del patio ──────────────────────────
+  // Textura: "Cracked Concrete Old 3D Scan" de grafi (Sketchfab, CC-BY-4.0)
+  const SLAB = 5; // Cada losa (con su junta) mide 5×5 unidades
+  const texLoader = new THREE.TextureLoader();
+  const loadFloorMap = (file, srgb) => {
+    const t = texLoader.load('./models/textures/' + file);
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(COURT.W / SLAB, COURT.D / SLAB);
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    return t;
+  };
+  // Normal + roughness del mismo escaneo: grietas y relieve reaccionan a las luces
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(COURT.W, COURT.D, 30, 35),
-    new THREE.MeshStandardMaterial({ color: 0x1c1f2a, roughness: 0.25, metalness: 0.12 })
+    new THREE.MeshStandardMaterial({
+      map:          loadFloorMap('prison_floor.jpg', true),
+      normalMap:    loadFloorMap('prison_floor_normal.jpg', false),
+      normalScale:  new THREE.Vector2(2.2, 2.2),
+      roughnessMap: loadFloorMap('prison_floor_roughness.jpg', false),
+      color: 0x9a9a9a, roughness: 1, metalness: 0,
+    })
   );
   floor.rotation.x = -Math.PI / 2;
   floor.receiveShadow = true;
   scene.add(floor);
 
-  // Grid sutil orientativo
-  const grid = new THREE.GridHelper(Math.max(COURT.W, COURT.D), 20, 0x1a2240, 0x111826);
-  grid.position.y = 0.01;
-  scene.add(grid);
+  buildFloorMarkings();
 
   // ─── Muros perimetrales ────────────────────────────────────────────────────
-  const wallMat = new THREE.MeshStandardMaterial({ color: 0x1e2840, roughness: 0.9 });
-  const capMat  = new THREE.MeshStandardMaterial({ color: 0x253050, roughness: 0.7 });
+  const concreteTex = getConcreteTexture();
+  const wallMat = new THREE.MeshStandardMaterial({ map: concreteTex, color: 0xb8bcc4, roughness: 0.95 });
+  const capMat  = new THREE.MeshStandardMaterial({ color: 0x4a4d52, roughness: 0.8 });
 
   function addWall(x, y, z, w, h, d) {
-    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), wallMat);
+    const m = new THREE.Mesh(tiledBox(w, h, d, WALL.H), wallMat);
     m.position.set(x, y, z);
     m.castShadow = m.receiveShadow = true;
     scene.add(m);
@@ -243,10 +558,13 @@ function buildEnvironment() {
   addWall(-sideOff, WALL.H / 2, hd, halfSide, WALL.H, WALL.T);
   addWall( sideOff, WALL.H / 2, hd, halfSide, WALL.H, WALL.T);
 
+  buildRazorWire();
+  buildOutsideScenery();
+
   // Marco de inicio (sur) — visual únicamente
   const gateMat = new THREE.MeshStandardMaterial({ color: 0x444455, roughness: 0.7 });
   [-1, 1].forEach(s => {
-    const post = new THREE.Mesh(new THREE.BoxGeometry(0.8, WALL.H + 0.5, WALL.T + 1), gateMat);
+    const post = new THREE.Mesh(tiledBox(0.8, WALL.H + 0.5, WALL.T + 1, WALL.H), wallMat);
     post.position.set(s * GATE_W / 2, WALL.H / 2, hd);
     scene.add(post);
   });
@@ -295,12 +613,19 @@ function buildLighting() {
 // §5 · SISTEMA DE COLISIONES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function addStaticCollider(mesh) {
-  mesh.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(mesh);
-  box.expandByScalar(0.05); // Margen mínimo anti-tunneling
-  staticColliders.push(box);
-  visionOccluders.push(box);
+function addStaticCollider(object) {
+  object.updateMatrixWorld(true);
+  // Una caja ajustada a los vértices de cada pieza (no una sola caja que envuelva
+  // todo el modelo): en modelos girados o con varias piezas la caja global queda
+  // mucho más grande que lo visible y frena al jugador antes de tocar el objeto.
+  object.traverse(child => {
+    if (!child.isMesh || !child.visible) return;
+    const box = new THREE.Box3().expandByObject(child, true);
+    if (box.isEmpty()) return;
+    box.expandByScalar(0.05); // Margen mínimo anti-tunneling
+    staticColliders.push(box);
+    visionOccluders.push(box);
+  });
 }
 
 const _visionRay = new THREE.Ray();
@@ -422,7 +747,7 @@ function loadGLTF(path) {
  * @param {number}      [extraY=0] Ajuste fino vertical si el modelo queda desalineado
  * @returns {THREE.Group}
  */
-function normalizeModel(model, targetSize, extraY = 0) {
+function normalizeModel(model, targetSize, extraY = 0, byHeight = false) {
   model.traverse(child => {
     if (child.isMesh) child.castShadow = child.receiveShadow = true;
   });
@@ -430,7 +755,7 @@ function normalizeModel(model, targetSize, extraY = 0) {
   const box  = new THREE.Box3().setFromObject(model);
   const size = new THREE.Vector3();
   box.getSize(size);
-  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const maxDim = (byHeight ? size.y : Math.max(size.x, size.y, size.z)) || 1;
   model.scale.setScalar(targetSize / maxDim);
   // Reasientar sobre Y=0
   model.updateMatrixWorld(true);
@@ -461,17 +786,18 @@ async function loadAllModels() {
   }
 
   // ── Torres ────────────────────────────────────────────────────────────────────
+  // "Prison Tower" de doktorkto607 (Sketchfab, CC-BY-4.0)
   await setProgress(38, 'Cargando torre izquierda...');
-  gltf = await loadGLTF('./models/torre.glb');
+  gltf = await loadGLTF('./models/prison_tower/scene.gltf');
   setupTower(gltf, -1);
 
   await setProgress(46, 'Cargando torre derecha...');
-  gltf = await loadGLTF('./models/torre.glb');
+  gltf = await loadGLTF('./models/prison_tower/scene.gltf');
   setupTower(gltf, 1);
 
   // ── Compuerta de escape ───────────────────────────────────────────────────────
   await setProgress(54, 'Cargando compuerta...');
-  gltf = await loadGLTF('./models/puerta.glb');
+  gltf = await loadGLTF('./models/puerta_prision.glb');
   setupGate(gltf);
 
   // ── Bomba ─────────────────────────────────────────────────────────────────────
@@ -484,114 +810,120 @@ async function loadAllModels() {
   gltf = await loadGLTF('./models/bolsa.glb');
   setupCamoPickup(gltf);
 
-  // ── Barreras bajas de concreto ────────────────────────────────────────────────
+  // ── Obstáculos del patio ───────────────────────────────────────────────────────
+  // Distribución pensada como patio real: comedor (mesas) al sur, gimnasio al
+  // este, contenedores de basura contra las paredes y barreras de concreto en
+  // zigzag antes de la zona restringida. Hay un pasillo central caminable desde
+  // el inicio hasta la compuerta (checkGatePath lo verifica) y ningún obstáculo
+  // pisa las rutas de los guardias (checkPatrolRoutes).
   await setProgress(73, 'Cargando barreras...');
-  const barrierPositions = [
-    [-8, -15], [8, -15], [0, 0], [-14, 6], [14, 6], [-5, -28], [5, -28],
+  const barrier = (await loadGLTF('./models/barrera.glb')).scene;
+  const barrierSpots = [
+    [ -6, -17, 0], [  6, -21, 0], [-3.5, -26, 0], [  8, -28, 0], // Zigzag de cobertura
+    [  0,   6, 0], [ -9,  -4, Math.PI / 2], [  9, -6, Math.PI / 2],  // Centro del patio
   ];
-  for (const [px, pz] of barrierPositions) {
-    gltf = await loadGLTF('./models/barrera.glb');
-    const m = normalizeModel(gltf.scene, 3, 0);
-    m.position.set(px, 0, pz);
-    scene.add(m);
-    addStaticCollider(m);
+  for (const [x, z, rotY] of barrierSpots) placeProp(barrier, { x, z, rotY, size: 3 });
+
+  // Comedor: mesas de picnic (largo del modelo en Z)
+  await setProgress(82, 'Cargando mesas...');
+  const table = (await loadGLTF('./models/props/mesa_picnic.glb')).scene;
+  const tableSpots = [[-6, 24, 0], [6, 24, 0], [-10, 12, 0], [10, 14.5, 0], [-6, 30, 0], [6, 30, 0]];
+  for (const [x, z, rotY] of tableSpots) placeProp(table, { x, z, rotY, size: 2.8 });
+
+  // Gimnasio al aire libre: barras de dominadas
+  await setProgress(88, 'Cargando gimnasio...');
+  const pullUp = (await loadGLTF('./models/props/barra_dominadas.glb')).scene;
+  for (const [x, z] of [[10, 2], [13, 2], [-12, 1]]) {
+    placeProp(pullUp, { x, z, size: 2.6, byHeight: true });
   }
 
-  // ── Cajas ─────────────────────────────────────────────────────────────────────
-  await setProgress(82, 'Cargando cajas...');
-  const boxPositions = [
-    [-12, -5], [12, -5], [-3, 12], [3, 12],
-    [-18, -18], [18, -18], [0, -12],
+  // Contenedores de basura (el modelo trae dos juntos, largo en X) contra las paredes
+  await setProgress(91, 'Cargando contenedores de basura...');
+  const dumpster = (await loadGLTF('./models/props/contenedor_basura.glb')).scene;
+  const dumpsterSpots = [
+    [-COURT.W / 2 + WALL.T + 1.1, -14, Math.PI / 2],
+    [ COURT.W / 2 - WALL.T - 1.1, -12, -Math.PI / 2],
+    [ 12, COURT.D / 2 - WALL.T - 1.1, Math.PI],
   ];
-  for (const [px, pz] of boxPositions) {
-    gltf = await loadGLTF('./models/caja.glb');
-    const m = normalizeModel(gltf.scene, 1.8, 0);
-    m.position.set(px, 0, pz);
-    scene.add(m);
-    addStaticCollider(m);
-  }
+  for (const [x, z, rotY] of dumpsterSpots) placeProp(dumpster, { x, z, rotY, size: 4 });
 
-  // ── Contenedores ──────────────────────────────────────────────────────────────
-  await setProgress(91, 'Cargando contenedores...');
-  const containerPositions = [[-20, -8], [20, -8], [0, -24]];
-  const DEBUG_COLLIDERS = false; // Cambiar a true para ver los colliders como cajas azules
-  for (const [px, pz] of containerPositions) {
-    gltf = await loadGLTF('./models/contenedor.glb');
-    const m = gltf.scene;
-    m.traverse(child => {
-      if (child.isMesh) child.castShadow = child.receiveShadow = true;
-    });
-
-    // PASO 1: Añadir a la escena con posición provisional para que matrixWorld sea válido
-    m.position.set(px, 0, pz);
-    scene.add(m);
-    scene.updateMatrixWorld(true); // Forzar propagación completa de todas las matrices
-
-    // PASO 2: Medir la geometría real usando matrixWorld ya válido
-    const vBox = new THREE.Box3();
-    m.traverse(child => {
-      if (child.isMesh && child.geometry) {
-        child.geometry.computeBoundingBox();
-        const gb = child.geometry.boundingBox.clone();
-        gb.applyMatrix4(child.matrixWorld);
-        vBox.union(gb);
-      }
-    });
-
-    // PASO 3: Escalar para que la altura exacta quede en 2.6 unidades
-    // Esto garantiza que la animación de escalar coincida perfectamente con el borde
-    // sin importar las proporciones (largo/ancho) del contenedor que descargues.
-    const vSize = new THREE.Vector3();
-    vBox.getSize(vSize);
-    const scaleFactor = vSize.y > 0.001 ? (2.6 / vSize.y) : 1;
-    m.scale.setScalar(scaleFactor);
-
-    // PASO 4: Centrar el modelo y reasientarlo sobre Y=0
-    // El nuevo modelo que descargaste tiene el pivot (el punto de anclaje) en una esquina
-    // en lugar del centro. Por eso el modelo aparecía desplazado hacia un lado de la caja.
-    // Calculamos su centro visual real y lo desplazamos para que encaje perfecto.
-    scene.updateMatrixWorld(true);
-    const vBox2 = new THREE.Box3();
-    m.traverse(child => {
-      if (child.isMesh && child.geometry) {
-        child.geometry.computeBoundingBox();
-        const gb = child.geometry.boundingBox.clone();
-        gb.applyMatrix4(child.matrixWorld);
-        vBox2.union(gb);
-      }
-    });
-    
-    const vCenter = new THREE.Vector3();
-    vBox2.getCenter(vCenter);
-    // Desplazar el contenedor para que su centro visual caiga exactamente en px, pz
-    m.position.x += (px - vCenter.x);
-    m.position.z += (pz - vCenter.z);
-    m.position.y += (0 - vBox2.min.y);
-
-    // PASO 5: Collider final dinámico — ahora que el modelo está centrado
-    // Leemos los vértices finales para armar la caja azul exacta a su alrededor.
-    scene.updateMatrixWorld(true);
-    const colBox = new THREE.Box3();
-    m.traverse(child => {
-      if (child.isMesh && child.geometry) {
-        child.geometry.computeBoundingBox();
-        const gb = child.geometry.boundingBox.clone();
-        gb.applyMatrix4(child.matrixWorld);
-        colBox.union(gb);
-      }
-    });
-
-    staticColliders.push(colBox);
-    visionOccluders.push(colBox);
-
-    if (DEBUG_COLLIDERS) {
-      // Visualizar el collider como wireframe azul para debug
-      const helper = new THREE.Box3Helper(colBox, 0x0088ff);
-      scene.add(helper);
-    }
-  }
+  await loadYardProps();
+  checkPatrolRoutes();
+  checkGatePath();
 
   await setProgress(100, '¡Listo para la fuga!');
+}
+
+/**
+ * Coloca una copia de un modelo: rota, escala por altura o dimensión mayor,
+ * asienta en el piso y (opcional) registra su collider.
+ */
+function placeProp(source, { x, z, rotY = 0, size, byHeight = false, collide = true }) {
+  const m = source.clone(true);
+  m.rotation.y = rotY;
+  normalizeModel(m, size, 0, byHeight);
+  m.position.x = x;
+  m.position.z = z;
+  scene.add(m);
+  if (collide) addStaticCollider(m);
+  return m;
+}
+
+/** Tramos de reja de alambre consecutivos a lo largo de un segmento recto. */
+function placeFenceLine(fence, segLen, alongX, x1, z1, x2, z2) {
+  const len = Math.hypot(x2 - x1, z2 - z1);
+  const n = Math.max(1, Math.round(len / segLen));
+  // Si el tramo del modelo es largo en Z, girarlo 90° extra para alinearlo
+  const rotY = -Math.atan2(z2 - z1, x2 - x1) + (alongX ? 0 : Math.PI / 2);
+  for (let i = 0; i < n; i++) {
+    const t = (i + 0.5) / n;
+    const seg = placeProp(fence, { x: x1 + (x2 - x1) * t, z: z1 + (z2 - z1) * t, rotY, size: 3.2, byHeight: true, collide: false });
+    seg.scale[alongX ? 'x' : 'z'] *= (len / n) / segLen; // Ajuste fino para cerrar el tramo exacto
+    addStaticCollider(seg);
+  }
+}
+
+// Props del patio (todos de Sketchfab, CC-BY-4.0 — ver CREDITS.md)
+async function loadYardProps() {
+  // ── Rejas: cercan el depósito (este) ──────────────────────────────────────────
+  await setProgress(94, 'Cargando rejas...');
+  const fence = (await loadGLTF('./models/props/reja.glb')).scene;
+  // Largo de un tramo una vez escalado a la altura de la reja
+  const probe = normalizeModel(fence.clone(true), 3.2, 0, true);
+  const probeSize = new THREE.Box3().setFromObject(probe).getSize(new THREE.Vector3());
+  const alongX = probeSize.x >= probeSize.z;
+  const segLen = Math.max(probeSize.x, probeSize.z);
+  const c = COURT_ZONE, p = PEN_ZONE;
+  placeFenceLine(fence, segLen, alongX, p.x0, p.z0, p.x1, p.z0);       // Depósito: lado norte
+  placeFenceLine(fence, segLen, alongX, p.x0, p.z0 + 6, p.x0, p.z1);   // Depósito: lado oeste (entrada al norte)
+
+  // ── Aro de básquet contra la pared oeste, mirando a la cancha ────────────────
+  await setProgress(96, 'Cargando cancha...');
+  const hoop = (await loadGLTF('./models/props/aro_basquet.glb')).scene;
+  // El frente del modelo (tablero y aro) es su +X: sin giro queda mirando al centro
+  placeProp(hoop, { x: c.x0 + 1.4, z: (c.z0 + c.z1) / 2, rotY: 0, size: 4.5, byHeight: true });
+
+  // ── Tribunas y banco alrededor de la cancha (frente de los modelos = +Z)
+  const bleacher = (await loadGLTF('./models/props/tribuna.glb')).scene;
+  for (const x of [-30.5, -23.5]) {
+    placeProp(bleacher, { x, z: 13.4, rotY: 0, size: 5.5 });                    // Lado norte
+  }
+  for (const x of [-29.5, -23.8]) {
+    placeProp(bleacher, { x, z: COURT.D / 2 - WALL.T / 2 - 1.5, rotY: Math.PI, size: 5.5 }); // Contra la pared sur
+  }
+  const bench = (await loadGLTF('./models/props/banco.glb')).scene;
+  placeProp(bench, { x: -19, z: COURT.D / 2 - WALL.T / 2 - 1.1, rotY: Math.PI, size: 3.5 });
+
+
+  // ── Barriles y cajones: grupos en el depósito y junto a las paredes ──────────
+  await setProgress(97, 'Cargando barriles...');
+  const crates = (await loadGLTF('./models/props/barriles_cajas.glb')).scene;
+  const crateSpots = [
+    // Depósito: se deja libre el paso desde la entrada hasta la bomba (30.1, 30.3)
+    [p.x1 - 3, p.z0 + 4, 0], [p.x0 + 5, p.z1 - 3, Math.PI],
+    [-30, -2, Math.PI / 2], [30, 2, -Math.PI / 2], [-29, -27, 0.4], [29, -27, -0.4],
+  ];
+  for (const [x, z, rotY] of crateSpots) placeProp(crates, { x, z, rotY, size: 6 });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -660,9 +992,117 @@ function fadeToAction(name, duration = 0.2, once = false) {
  * Carga el modelo base FBX del prisionero y todos los clips de Mixamo.
  * Escala al tamaño humano y asienta sobre Y=0.
  */
+/**
+ * Ata una malla estática (sin esqueleto) al esqueleto Mixamo de `rigged`:
+ * la alinea a la malla original en pose T, calcula pesos de piel por
+ * distancia a los huesos y oculta las mallas originales. Así el modelo nuevo
+ * reutiliza todas las animaciones Mixamo ya existentes.
+ */
+function autoSkinToRig(rigged, staticScene) {
+  // Malla de referencia: la que usa el esqueleto más completo
+  let ref = null;
+  rigged.traverse(o => {
+    if (o.isSkinnedMesh && (!ref || o.skeleton.bones.length > ref.skeleton.bones.length)) ref = o;
+  });
+  if (!ref) return false;
+
+  const skeleton = ref.skeleton;
+  skeleton.pose();
+  // Posición de cada hueso en el espacio de bind de la malla de referencia
+  const bonePos = skeleton.boneInverses.map(inv => new THREE.Vector3().applyMatrix4(inv.clone().invert()));
+  // Segmentos padre→hijo: el peso va al padre, que es el hueso que lo rota
+  const segs = [];
+  skeleton.bones.forEach((bone, i) => {
+    const pi = skeleton.bones.indexOf(bone.parent);
+    if (pi >= 0) segs.push({ bone: pi, a: bonePos[pi], b: bonePos[i] });
+  });
+
+  // Alinear la malla nueva al volumen de la original (alto, pies y centro)
+  ref.geometry.computeBoundingBox();
+  const refBox = ref.geometry.boundingBox.clone().applyMatrix4(ref.bindMatrix);
+  staticScene.updateMatrixWorld(true);
+  const srcBox = new THREE.Box3().setFromObject(staticScene);
+  const k = (refBox.max.y - refBox.min.y) / (srcBox.max.y - srcBox.min.y);
+  const align = new THREE.Matrix4()
+    .makeTranslation(
+      (refBox.min.x + refBox.max.x) / 2, refBox.min.y, (refBox.min.z + refBox.max.z) / 2)
+    .multiply(new THREE.Matrix4().makeScale(k, k, k))
+    .multiply(new THREE.Matrix4().makeTranslation(
+      -(srcBox.min.x + srcBox.max.x) / 2, -srcBox.min.y, -(srcBox.min.z + srcBox.max.z) / 2));
+
+  // El modelo no trae texturas: se pinta por vértice según el hueso dominante
+  const SKIN = new THREE.Color(0xc68e6a), SUIT = new THREE.Color(0xe0661c), SHOE = new THREE.Color(0x2a2a2a);
+  const partColor = name => /Head|Neck/.test(name) ? SKIN
+    : /Hand/.test(name) ? SKIN
+    : /Foot|Toe/.test(name) ? SHOE
+    : SUIT;
+  const boneColor = skeleton.bones.map(b => partColor(b.name));
+  const ab = new THREE.Vector3(), ap = new THREE.Vector3(), v = new THREE.Vector3();
+  const segDist = (p, sg) => {
+    ab.subVectors(sg.b, sg.a);
+    const t = THREE.MathUtils.clamp(ap.subVectors(p, sg.a).dot(ab) / (ab.lengthSq() || 1), 0, 1);
+    return p.distanceTo(ap.copy(sg.a).addScaledVector(ab, t));
+  };
+
+  staticScene.traverse(src => {
+    if (!src.isMesh) return;
+    const geo = src.geometry.clone();
+    // Llevar vértices al espacio de bind del esqueleto
+    geo.applyMatrix4(new THREE.Matrix4().multiplyMatrices(align, src.matrixWorld));
+    const pos = geo.attributes.position;
+    const skinIndex = new Uint16Array(pos.count * 4);
+    const skinWeight = new Float32Array(pos.count * 4);
+    const colors = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i);
+      // Dos huesos más cercanos, peso ∝ 1/d⁴ para transiciones suaves en articulaciones
+      let b1 = 0, d1 = Infinity, b2 = 0, d2 = Infinity;
+      for (const sg of segs) {
+        const d = segDist(v, sg);
+        if (d < d1) { if (sg.bone !== b1) { b2 = b1; d2 = d1; } b1 = sg.bone; d1 = d; }
+        else if (d < d2 && sg.bone !== b1) { b2 = sg.bone; d2 = d; }
+      }
+      const w1 = 1 / Math.pow(d1 + 1e-3, 4), w2 = 1 / Math.pow(d2 + 1e-3, 4);
+      skinIndex[i * 4] = b1; skinIndex[i * 4 + 1] = b2;
+      skinWeight[i * 4] = w1 / (w1 + w2); skinWeight[i * 4 + 1] = w2 / (w1 + w2);
+      boneColor[b1].toArray(colors, i * 3);
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, 4));
+    geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeight, 4));
+    geo.applyMatrix4(ref.bindMatrixInverse);
+
+    // El export de Sketchfab marca el material como metálico al 100% (se ve negro)
+    const mat = src.material.clone();
+    mat.metalness = 0;
+    mat.roughness = 0.85;
+    mat.vertexColors = true;
+    const mesh = new THREE.SkinnedMesh(geo, mat);
+    mesh.position.copy(ref.position);
+    mesh.quaternion.copy(ref.quaternion);
+    mesh.scale.copy(ref.scale);
+    mesh.frustumCulled = false;
+    ref.parent.add(mesh);
+    mesh.bind(skeleton, ref.bindMatrix);
+  });
+
+  return ref;
+}
+
 async function setupPlayerFBX() {
   // ── 1. Modelo base (contiene mesh + esqueleto + clip idle) ────────────────
   const base = await loadFBX('./models/prisionero_idle.fbx');
+
+  // ── 1b. Malla del protagonista: "preso" de Jacy.Junior (Sketchfab, CC-BY-4.0)
+  // El modelo no trae esqueleto: se ata al rig Mixamo para heredar las animaciones.
+  try {
+    const originals = [];
+    base.traverse(o => { if (o.isSkinnedMesh) originals.push(o); });
+    const preso = await loadGLTF('./models/preso.glb');
+    if (autoSkinToRig(base, preso.scene)) originals.forEach(o => { o.visible = false; });
+  } catch (err) {
+    console.warn('No se pudo aplicar el modelo preso, se usa el original:', err);
+  }
 
   // Normalizar escala: Mixamo exporta en centímetros (escala ~0.01)
   // Queremos que el personaje mida PL.hStand (1.8u) en el mundo
@@ -836,14 +1276,7 @@ async function setupGuardFBX(index) {
     leftHand.add(spot);
   }
 
-  // Rutas de patrullaje: guardia 0 en oeste, guardia 1 en este
-  const patrolRoutes = [
-    { a: [-14, -22], b: [-14, 22] },
-    { a: [ 14,  22], b: [ 14,-22] },
-    { a: [-25,  -8], b: [ -8, -8] },
-    { a: [ 25,   8], b: [  8,  8] },
-  ];
-  const route = patrolRoutes[index % patrolRoutes.length];
+  const route = PATROL_ROUTES[index % PATROL_ROUTES.length];
   const patrolA = new THREE.Vector3(route.a[0], 0, route.a[1]);
   const patrolB = new THREE.Vector3(route.b[0], 0, route.b[1]);
   base.position.copy(patrolA);
@@ -903,17 +1336,153 @@ function fadeToGuardAction(g, name, duration = 0.3, once = false) {
   }
 }
 
-function setupTower(gltf, side) {
-  // Torres en las DOS esquinas de la compuerta norte (objetivo de escape)
-  // side: -1 = noroeste, 1 = noreste
-  const tw = GATE_W / 2 + 3;          // Flanquean la compuerta
-  const tx = side * tw;
-  const tz = -COURT.D / 2 + 4;        // Pegadas a la pared norte
+// Degradado radial compartido por las huellas de los reflectores
+let lightPoolTexture = null;
+function getLightPoolTexture() {
+  if (!lightPoolTexture) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const ctx = c.getContext('2d');
+    const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.7, 'rgba(255,255,255,0.85)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 128, 128);
+    lightPoolTexture = new THREE.CanvasTexture(c);
+    lightPoolTexture.colorSpace = THREE.SRGBColorSpace;
+  }
+  return lightPoolTexture;
+}
 
-  const model = normalizeModel(gltf.scene, WALL.H * 1.9, 0);
-  model.position.set(tx, 0, tz);
+// Rutas de patrullaje (ida y vuelta). Cada carril pasa libre entre barreras,
+// cajas y contenedores; checkPatrolRoutes() avisa si un obstáculo nuevo lo pisa.
+const PATROL_ROUTES = [
+  { a: [-16.3, -22], b: [-16.3, 22] }, // Oeste: entre las cajas y la cancha
+  { a: [ 16.3,  22], b: [ 16.3,-22] }, // Este
+  { a: [-26,  -13], b: [-10,  -13] },  // Noroeste: al sur del contenedor
+  { a: [ 25,    8], b: [  8,    8] },  // Centro-este
+];
+
+/**
+ * Verifica (BFS en grilla de 0,5u) que exista un camino caminable, sin trepar
+ * nada, desde la posición inicial del jugador hasta la compuerta norte.
+ */
+function checkGatePath() {
+  const STEP = 0.5, R = PL.radius + 0.06;
+  const hw = COURT.W / 2 - WALL.T - PL.radius, hd = COURT.D / 2 - WALL.T - PL.radius;
+  const nx = Math.floor((2 * hw) / STEP) + 1, nz = Math.floor((2 * hd) / STEP) + 1;
+  const gateBox = staticColliders[gateColliderIdx];
+  const free = (x, z) => !staticColliders.some(box => box !== gateBox && box.max.y > 0.4 &&
+    x > box.min.x - R && x < box.max.x + R && z > box.min.z - R && z < box.max.z + R);
+  const cell = (x, z) => [Math.round((x + hw) / STEP), Math.round((z + hd) / STEP)];
+  const [sx, sz] = cell(playerPos.x, playerPos.z);
+  const seen = new Uint8Array(nx * nz);
+  const queue = [[sx, sz]];
+  seen[sz * nx + sx] = 1;
+  while (queue.length) {
+    const [ix, iz] = queue.shift();
+    const x = -hw + ix * STEP, z = -hd + iz * STEP;
+    if (iz === 0 && Math.abs(x) < GATE_W / 2 - PL.radius) {
+      console.log('[PrisonEscape] Camino libre del inicio a la compuerta: OK');
+      return true;
+    }
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const jx = ix + dx, jz = iz + dz;
+      if (jx < 0 || jz < 0 || jx >= nx || jz >= nz || seen[jz * nx + jx]) continue;
+      seen[jz * nx + jx] = 1;
+      if (free(-hw + jx * STEP, -hd + jz * STEP)) queue.push([jx, jz]);
+    }
+  }
+  console.warn('[PrisonEscape] No hay camino caminable del inicio a la compuerta');
+  return false;
+}
+
+/** Avisa por consola si algún carril de patrulla atraviesa un collider. */
+function checkPatrolRoutes() {
+  const GUARD_R = 0.45;
+  const p = new THREE.Vector3();
+  PATROL_ROUTES.forEach((r, i) => {
+    const a = new THREE.Vector3(r.a[0], 0.5, r.a[1]), b = new THREE.Vector3(r.b[0], 0.5, r.b[1]);
+    const steps = Math.ceil(a.distanceTo(b) / 0.25);
+    for (let k = 0; k <= steps; k++) {
+      p.lerpVectors(a, b, k / steps);
+      const hit = staticColliders.find(box => box.max.y < 9 &&
+        p.x > box.min.x - GUARD_R && p.x < box.max.x + GUARD_R &&
+        p.z > box.min.z - GUARD_R && p.z < box.max.z + GUARD_R);
+      if (hit) {
+        console.warn(`Ruta de guardia ${i} atraviesa un obstáculo en (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`);
+        return;
+      }
+    }
+  });
+}
+
+/**
+ * Colliders de la torre: una columna por cada pieza que apoya en el piso
+ * (patas y escalera), medida con los vértices de la base. Más altas que el
+ * límite de trepado para que el jugador no las atraviese ni se suba.
+ */
+function addTowerColliders(model) {
+  model.updateMatrixWorld(true);
+  const BASE_Y = 2.5;
+  const v = new THREE.Vector3();
+  const boxes = [];
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position;
+    const box = new THREE.Box3();
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      if (v.y < BASE_Y) box.expandByPoint(v);
+    }
+    if (!box.isEmpty()) boxes.push(box);
+  });
+  // Fusionar piezas que se tocan (pata + placa, postes de la escalera)
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      if (boxes[i].intersectsBox(boxes[j])) {
+        boxes[i].union(boxes[j]);
+        boxes.splice(j, 1);
+        j = i;
+      }
+    }
+  }
+  for (const box of boxes) {
+    box.min.y = 0;
+    box.max.y = 12;
+    box.expandByScalar(0.05);
+    staticColliders.push(box);
+  }
+}
+
+function setupTower(gltf, side) {
+  // Torres sobre la pared norte, a medio camino entre la compuerta y las esquinas
+  // side: -1 = noroeste, 1 = noreste
+  const tx = side * (COURT.W / 2 - 17);
+  const tz = -COURT.D / 2 + 6;          // Cerca de la pared norte
+
+  const model = normalizeModel(gltf.scene, WALL.H * 2.8, 0, true);
+  model.position.x = tx;
+  model.position.z = tz;
+
+  // El modelo trae su propia losa de piso (nodo "Cube") y la estructura está
+  // apoyada sobre ella. Se quita la losa (si no, flota a la altura de la cintura)
+  // y se baja la torre el espesor de la losa para que apoye en el piso del patio.
+  const groundSlab = model.getObjectByName('Cube');
+  if (groundSlab) {
+    model.updateMatrixWorld(true);
+    const slabTop = new THREE.Box3().setFromObject(groundSlab).max.y;
+    groundSlab.removeFromParent();
+    model.position.y -= slabTop;
+  }
+  // El modelo viene sin texturas: acero oscuro con la mugre del concreto encima
+  const towerMat = new THREE.MeshStandardMaterial({
+    map: getConcreteTexture(), color: 0x6b7078, metalness: 0.55, roughness: 0.7,
+  });
+  model.traverse(child => { if (child.isMesh) child.material = towerMat; });
   scene.add(model);
-  // Las torres son decorativas: su malla puede ocupar el pasillo de salida.
+  addTowerColliders(model);
 
   // Altura real de la torre tras normalizar
   model.updateMatrixWorld(true);
@@ -922,12 +1491,13 @@ function setupTower(gltf, side) {
 
   // ── SpotLight potente: haz de luz visible sobre el suelo (día nublado) ─────
   // angle más amplio + alta intensidad → círculo de luz claramente distinguible
-  const spot = new THREE.SpotLight(0xfff5cc, 350, 80, Math.PI / 6, 0.3, 1.0);
+  // Haz estrecho y de borde casi duro para que el círculo iluminado coincida con el cono
+  const spot = new THREE.SpotLight(0xfff5cc, 350, 140, Math.PI / 24, 0.1, 1.0);
   spot.position.set(tx, topY + 0.5, tz);
   spot.castShadow = true;
   spot.shadow.mapSize.set(1024, 1024);
   spot.shadow.camera.near = 2;
-  spot.shadow.camera.far  = 80;
+  spot.shadow.camera.far  = 140;
   scene.add(spot);
 
   const target = new THREE.Object3D();
@@ -936,36 +1506,69 @@ function setupTower(gltf, side) {
   scene.add(target);
   spot.target = target;
 
-  // ── Disco de luz en el suelo (visualmente indica zona peligrosa) ───────────
-  // Un disco plano ligeramente elevado con emissive para que se vea incluso de día
-  const discMat = new THREE.MeshBasicMaterial({
-    color: 0xffee88, transparent: true, opacity: 0.22,
-    depthWrite: false,
-  });
-  const disc = new THREE.Mesh(new THREE.CircleGeometry(7, 32), discMat);
-  disc.rotation.x = -Math.PI / 2;
-  disc.position.set(target.position.x, 0.02, target.position.z);
-  scene.add(disc);
-
   // ── Cono visual volumétrico del haz (AdditiveBlending) ────────────────────
+  // Geometría unitaria: se escala cada frame para ir de la lámpara al suelo.
+  // Degradado por vértice: casi invisible junto a la lámpara y más intenso al
+  // llegar al piso, así la luz se concentra en la huella del suelo.
+  const coneGeo = new THREE.ConeGeometry(1, 1, 48, 1, true);
+  const conePos = coneGeo.attributes.position;
+  const coneCol = new Float32Array(conePos.count * 3);
+  for (let i = 0; i < conePos.count; i++) {
+    const k = Math.pow(0.5 - conePos.getY(i), 4); // 0 en el vértice → 1 en la base
+    coneCol.set([k, k * 0.96, k * 0.8], i * 3);
+  }
+  coneGeo.setAttribute('color', new THREE.BufferAttribute(coneCol, 3));
   const spotCone = new THREE.Mesh(
-    new THREE.ConeGeometry(12, 26, 32, 1, true),
+    coneGeo,
     new THREE.MeshBasicMaterial({
-      color: 0xfff5cc, transparent: true, opacity: 0.08,
+      vertexColors: true, transparent: true, opacity: 0.06,
       side: THREE.DoubleSide, depthWrite: false,
       blending: THREE.AdditiveBlending,
     })
   );
   scene.add(spotCone);
 
-  spotRigs.push({ spot, target, spotCone, disc, tx, tz, topY, phase: side === -1 ? 0 : Math.PI });
+  // ── Huella de luz en el suelo: círculo brillante de borde suave ───────────
+  // Se escala cada frame a la elipse exacta donde el cono toca el piso.
+  const pool = new THREE.Mesh(
+    new THREE.CircleGeometry(1, 48),
+    new THREE.MeshBasicMaterial({
+      map: getLightPoolTexture(), color: 0xfff2b0, transparent: true, opacity: 0.55,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+    })
+  );
+  pool.rotation.order = 'YXZ';
+  pool.rotation.x = -Math.PI / 2;
+  pool.position.y = 0.03;
+  scene.add(pool);
+
+  spotRigs.push({ spot, target, spotCone, pool, tx, tz, topY, phase: side === -1 ? 0 : Math.PI });
 }
+
+// "Prison Gate" (portón corredizo de barrotes): medidas del modelo original.
+// La hoja de barrotes ocupa X ∈ [PANEL_X0, PANEL_X1] y la viga-riel superior
+// arranca en HEADER_Y; a la derecha de la hoja sólo hay riel (el hueco al abrirse).
+const GATE_MODEL = { PANEL_X0: -0.64, PANEL_X1: 0.745, HEADER_Y: 1.14 };
 
 function setupGate(gltf) {
   const gateZ = -COURT.D / 2 + 1.5;
-  const model = normalizeModel(gltf.scene, GATE_W, 0);
-  model.position.set(0, 0, gateZ);
+  const openingH = WALL.H - 1.5; // Altura libre bajo el dintel
+  const model = gltf.scene;
+  model.traverse(child => {
+    if (child.isMesh) child.castShadow = child.receiveShadow = true;
+  });
+  // Escala no uniforme: la hoja llena exacto el hueco (GATE_W × openingH) y la
+  // viga queda a la altura del dintel, corriendo sobre la pared como un riel.
+  const sx = GATE_W / (GATE_MODEL.PANEL_X1 - GATE_MODEL.PANEL_X0);
+  const sy = openingH / GATE_MODEL.HEADER_Y;
+  model.scale.set(sx, sy, 5);
+  model.position.set(
+    -(GATE_MODEL.PANEL_X0 + GATE_MODEL.PANEL_X1) / 2 * sx,
+    0,
+    -COURT.D / 2 + WALL.T / 2 + 0.35 // Pegada a la cara interior del muro
+  );
   scene.add(model);
+  // "Prison Gate" de exiS7-Gs (Sketchfab, CC-BY-4.0)
   // Collider simple y delgado: el tamaño del asset no debe crear una pared invisible.
   const gateCollider = new THREE.Box3(
     new THREE.Vector3(-GATE_W / 2, 0, gateZ - 0.55),
@@ -1010,11 +1613,14 @@ function setupGate(gltf) {
 }
 
 function setupBombPickup(gltf) {
-  // Reubicada en zona central-sur: visible desde el punto de inicio del jugador
-  const pos   = new THREE.Vector3(0, 0, 18);
+  // Al fondo del depósito enrejado (este), entre los barriles y cajones
+  const pos   = new THREE.Vector3(30.1, 0, 30.3);
   const model = normalizeModel(gltf.scene, 0.7, 0);
   bombMesh = model;
-  model.position.copy(pos);
+  // Sólo X/Z: normalizeModel ya asentó el modelo sobre el piso
+  model.userData.groundOffset = model.position.y;
+  model.position.x = pos.x;
+  model.position.z = pos.z;
   scene.add(model);
 
   // ── Luz roja parpadeante ───────────────────────────────────────────────────
@@ -1023,12 +1629,12 @@ function setupBombPickup(gltf) {
   scene.add(pl);
   bombPulseLight = pl;
 
-  // ── Halo/aro brillante encima del ítem (anillo metálico rojo) ─────────────
-  // El aro rota en el update loop (worldItems con type='bomb') para ser llamativo
-  const haloMat = new THREE.MeshBasicMaterial({ color: 0xff2200, transparent: true, opacity: 0.9 });
-  const halo    = new THREE.Mesh(new THREE.TorusGeometry(0.65, 0.07, 8, 24), haloMat);
-  halo.position.set(pos.x, 1.2, pos.z);
-  halo.rotation.x = Math.PI / 2;
+  // ── Aro rojo pintado en el piso alrededor del ítem ───────────────────────
+  // Gira en el update loop (worldItems con type='bomb') para ser llamativo
+  const haloMat = new THREE.MeshBasicMaterial({ color: 0xff2200, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false });
+  const halo    = new THREE.Mesh(new THREE.RingGeometry(0.55, 0.7, 32), haloMat);
+  halo.position.set(pos.x, 0.03, pos.z);
+  halo.rotation.x = -Math.PI / 2;
   scene.add(halo);
 
   // ── Flecha vertical (cilindro estrecho) sobre el halo ─────────────────────
@@ -1042,23 +1648,29 @@ function setupBombPickup(gltf) {
 
   worldItems.push({
     type: 'bomb', mesh: model, halo,
+    extras: [halo, arrowStem, arrowTip], // Se quitan al recogerla
     pos: pos.clone(), active: true, label: '[ E ] Recoger BOMBA',
   });
 }
 
 function setupCamoPickup(gltf) {
-  // A pocos pasos del inicio, libre de obstáculos y fácil de reconocer.
-  const pos   = new THREE.Vector3(5, 0, 29);
-  const model = normalizeModel(gltf.scene, 1.2, 0);
-  model.position.copy(pos);
+  // En la cancha de básquet, frente al aro
+  const pos   = new THREE.Vector3(-24, 0, (COURT_ZONE.z0 + COURT_ZONE.z1) / 2);
+  // "Trash Bag" de Hellbrush (Sketchfab, CC-BY-4.0). Tamaño suficiente para
+  // tapar al jugador agachado cuando se esconde debajo.
+  const model = normalizeModel(gltf.scene, 1.4, 0);
+  model.userData.groundOffset = model.position.y; // Altura para quedar apoyada
+  model.position.x = pos.x;
+  model.position.z = pos.z;
   scene.add(model);
 
+  // Aro verde pintado en el piso
   const marker = new THREE.Mesh(
-    new THREE.TorusGeometry(0.9, 0.07, 8, 28),
-    new THREE.MeshBasicMaterial({ color: 0x66ffbb, transparent: true, opacity: 0.9 })
+    new THREE.RingGeometry(0.85, 1.0, 40),
+    new THREE.MeshBasicMaterial({ color: 0x66ffbb, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false })
   );
-  marker.rotation.x = Math.PI / 2;
-  marker.position.set(pos.x, 0.08, pos.z);
+  marker.rotation.x = -Math.PI / 2;
+  marker.position.set(pos.x, 0.03, pos.z);
   scene.add(marker);
   const markerLight = new THREE.PointLight(0x55ffbb, 4, 7);
   markerLight.position.set(pos.x, 1.2, pos.z);
@@ -1269,34 +1881,32 @@ function updateSpotlights(t) {
       // — Tracking: el foco se clava sobre el jugador —
       rig.target.position.set(playerPos.x, 0, playerPos.z);
       rig.spot.color.set(0xff4400);
-      rig.spot.intensity = 200;
+      rig.spot.intensity = 800;
     } else {
       // — Barrido senoidal orgánico (suma de dos frecuencias) —
-      const sx = Math.sin(t * 0.38 + rig.phase) * 28;
-      const sz = Math.sin(t * 0.22 + rig.phase + 1.4) * 28 + 24;
+      // Centro del barrido desplazado hacia el medio del patio
+      const sx = Math.sin(t * 0.38 + rig.phase) * 20 - rig.tx * 0.6;
+      const sz = Math.sin(t * 0.22 + rig.phase + 1.4) * 22 + 30;
       rig.target.position.set(rig.tx + sx, 0, rig.tz + sz);
       rig.spot.color.set(0xffee88);
-      rig.spot.intensity = 130;
+      rig.spot.intensity = 650;
     }
     rig.target.updateMatrixWorld();
 
-    // — Actualizar cono visual —
-    const dx   = rig.target.position.x - rig.tx;
-    const dz   = rig.target.position.z - rig.tz;
-    const dLen = Math.sqrt(dx * dx + dz * dz) || 1;
-    const cLen = 28;
-    const nx = dx / dLen, nz = dz / dLen;
-
-    rig.spotCone.position.set(
-      rig.tx + nx * cLen * 0.46,
-      rig.spot.position.y - cLen * 0.46,
-      rig.tz + nz * cLen * 0.46
-    );
-
-    const lookDir = new THREE.Vector3(dx, -rig.spot.position.y, dz).normalize();
-    if (lookDir.lengthSq() > 0.001) {
-      rig.spotCone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), lookDir);
-    }
+    // — Actualizar cono visual: vértice en la lámpara, base en el suelo —
+    const beam = new THREE.Vector3().subVectors(rig.target.position, rig.spot.position);
+    const beamLen = beam.length();
+    const beamR = beamLen * Math.tan(rig.spot.angle);
+    rig.spotCone.scale.set(beamR, beamLen, beamR);
+    rig.beamR = beamR;
+    // Huella elíptica: se alarga en la dirección del haz cuanto más inclinado llega
+    const sinElev = Math.max(0.2, -beam.y / beamLen);
+    rig.pool.position.x = rig.target.position.x;
+    rig.pool.position.z = rig.target.position.z;
+    rig.pool.rotation.y = Math.atan2(beam.x, beam.z);
+    rig.pool.scale.set(beamR, beamR / sinElev, 1);
+    rig.spotCone.position.copy(rig.spot.position).addScaledVector(beam, 0.5);
+    rig.spotCone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), beam.normalize());
   });
 
   // — Detección por luz (sólo en PLAYING) —
@@ -1313,13 +1923,13 @@ function checkSpotDetection() {
     _sDir.subVectors(rig.target.position, rig.spot.position).normalize();
     _sToPlr.subVectors(playerPos, rig.spot.position).normalize();
     const angle = _sDir.angleTo(_sToPlr);
-    // Doble condición: ángulo dentro del cono Y jugador cerca del círculo
+    // Doble condición: ángulo dentro del cono Y jugador cerca de la huella
     // iluminado en el suelo (evita falsos positivos en la zona de inicio).
     const groundDist = Math.hypot(
       playerPos.x - rig.target.position.x,
       playerPos.z - rig.target.position.z
     );
-    if (angle < rig.spot.angle + 0.06 && groundDist < 7 &&
+    if (angle < rig.spot.angle + 0.03 && groundDist < rig.beamR * 1.5 &&
         hasClearLineOfSight(rig.spot.position, playerPos)) {
       triggerAlert('spotlight');
       return;
@@ -1506,6 +2116,7 @@ function pickupItem(item) {
   scene.remove(item.mesh);
   if (item.marker) scene.remove(item.marker);
   if (item.markerLight) scene.remove(item.markerLight);
+  if (item.extras) item.extras.forEach(o => scene.remove(o));
 
   isInteracting = true;
   fadeToAction('agarrar', 0.2, true);
@@ -1558,21 +2169,23 @@ function updateBombPlacing(dt) {
   }
 }
 
+const BOMB_FUSE_SECONDS = 8; // Tiempo entre plantar la bomba y la explosión
+
 function plantBomb() {
   hasBomb     = false;
   bombPlanted = true;
   soundEffects.play('bombPlant');
   if (bombMesh) {
-    bombMesh.position.set(0, 0.25, -COURT.D / 2 + 1.5);
+    bombMesh.position.set(0, bombMesh.userData.groundOffset || 0, -COURT.D / 2 + 1.5);
     bombMesh.rotation.set(0, 0, 0);
     scene.add(bombMesh);
   }
   updateHUD();
 
   $('bomb-countdown').style.display = 'flex';
-  let t = 5;
+  let t = BOMB_FUSE_SECONDS;
   $('bomb-count-num').textContent = t;
-  showMessage('💣 ¡MECHA ENCENDIDA! Aléjate — 5 segundos...', 5500);
+  showMessage(`💣 ¡MECHA ENCENDIDA! Aléjate — ${BOMB_FUSE_SECONDS} segundos...`, BOMB_FUSE_SECONDS * 1000 + 500);
 
   bombFuseInterval = setInterval(() => {
     t--;
@@ -1604,8 +2217,8 @@ function detonateGate() {
 
   if (bombMesh) { scene.remove(bombMesh); bombMesh = null; }
 
-  // Eliminar la puerta de la escena y su colisionador
-  if (gateMesh) { scene.remove(gateMesh); gateMesh = null; }
+  // La puerta sale despedida hacia afuera dando vueltas; su colisionador se quita ya
+  if (gateMesh) { launchGate(gateMesh); gateMesh = null; }
   if (gateColliderIdx >= 0) {
     const [removedCollider] = staticColliders.splice(gateColliderIdx, 1);
     const occluderIndex = visionOccluders.indexOf(removedCollider);
@@ -1614,8 +2227,7 @@ function detonateGate() {
   }
   gateOpen = true;
 
-  // Partículas de escombros
-  spawnExplosion(new THREE.Vector3(0, 2, -COURT.D / 2 + 2));
+  spawnExplosion(new THREE.Vector3(0, 1.2, -COURT.D / 2 + 1.8));
   showMessage('💥 ¡BRECHA ABIERTA! Cruza y escapa.', 4000);
 }
 
@@ -1649,23 +2261,158 @@ function openGateWithKey() {
 
 // ─── Partículas de explosión ──────────────────────────────────────────────────
 
+/** El portón vuela hacia afuera girando y cae fuera del patio. */
+function launchGate(gate) {
+  const vel  = new THREE.Vector3((Math.random() - 0.5) * 3, 9, -16);
+  const spin = new THREE.Vector3(-4 - Math.random() * 2, (Math.random() - 0.5) * 3, (Math.random() - 0.5) * 2);
+  let life = 3;
+  timedEffects.push(dt => {
+    life -= dt;
+    vel.y -= 18 * dt;
+    gate.position.addScaledVector(vel, dt);
+    gate.rotation.x += spin.x * dt;
+    gate.rotation.y += spin.y * dt;
+    gate.rotation.z += spin.z * dt;
+    if (life <= 0) { scene.remove(gate); return false; }
+    return true;
+  });
+}
+
+/** Explosión de la compuerta: fuego, onda, humo, chispas, esquirlas, luz y sacudida. */
 function spawnExplosion(origin) {
-  for (let i = 0; i < 28; i++) {
-    const m = new THREE.Mesh(
-      new THREE.SphereGeometry(0.1 + Math.random() * 0.25),
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color().setHSL(0.05 + Math.random() * 0.1, 1, 0.4 + Math.random() * 0.4),
-      })
+  const additive = (color, opacity) => new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+
+  // ── Bola de fuego: núcleo amarillo + capa naranja que se expanden y apagan
+  [[0xfff1a0, 0.95, 4.5, 0.45], [0xff6a10, 0.8, 7, 0.8]].forEach(([color, op, maxR, dur]) => {
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), additive(color, op));
+    ball.position.copy(origin);
+    scene.add(ball);
+    let t = 0;
+    timedEffects.push(dt => {
+      t += dt;
+      const k = Math.min(t / dur, 1);
+      ball.scale.setScalar(0.3 + (1 - Math.pow(1 - k, 3)) * maxR);
+      ball.material.opacity = op * (1 - k);
+      if (k >= 1) { scene.remove(ball); return false; }
+      return true;
+    });
+  });
+
+  // ── Onda expansiva en el piso
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.8, 1, 48), additive(0xffc070, 0.8));
+  ring.material.side = THREE.DoubleSide;
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(origin.x, 0.05, origin.z);
+  scene.add(ring);
+  let rt = 0;
+  timedEffects.push(dt => {
+    rt += dt;
+    const k = Math.min(rt / 0.7, 1);
+    ring.scale.setScalar(1 + k * 16);
+    ring.material.opacity = 0.8 * (1 - k);
+    if (k >= 1) { scene.remove(ring); return false; }
+    return true;
+  });
+
+  // ── Destello de luz que ilumina muros y patio
+  const flashLight = new THREE.PointLight(0xffa040, 900, 60, 1.6);
+  flashLight.position.copy(origin).setY(3);
+  scene.add(flashLight);
+  let lt = 0;
+  timedEffects.push(dt => {
+    lt += dt;
+    flashLight.intensity = 900 * Math.max(0, 1 - lt / 0.9) ** 2;
+    if (lt >= 0.9) { scene.remove(flashLight); return false; }
+    return true;
+  });
+
+  // ── Columna de humo: bolas grises que suben, se agrandan y se disipan
+  for (let i = 0; i < 18; i++) {
+    const smoke = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 12, 10),
+      new THREE.MeshBasicMaterial({ color: 0x3a3836, transparent: true, opacity: 0, depthWrite: false })
     );
-    m.position.copy(origin);
-    const vel = new THREE.Vector3(
-      (Math.random() - 0.5) * 10,
-      2 + Math.random() * 7,
-      (Math.random() - 0.5) * 10
-    );
-    scene.add(m);
-    debrisParticles.push({ mesh: m, vel, life: 2.8 });
+    smoke.position.copy(origin).add(new THREE.Vector3((Math.random() - 0.5) * 3, Math.random() * 1.5, (Math.random() - 0.5) * 2));
+    scene.add(smoke);
+    const rise = new THREE.Vector3((Math.random() - 0.5) * 0.8, 1.5 + Math.random() * 1.8, (Math.random() - 0.5) * 0.8);
+    const delay = 0.15 + Math.random() * 0.5, dur = 3.5 + Math.random() * 2;
+    let st = 0;
+    timedEffects.push(dt => {
+      st += dt;
+      if (st < delay) return true;
+      const k = Math.min((st - delay) / dur, 1);
+      smoke.position.addScaledVector(rise, dt);
+      smoke.scale.setScalar(1 + k * 3.5);
+      smoke.material.opacity = 0.55 * Math.sin(Math.PI * Math.min(1, k * 1.4 + 0.05)) * (1 - k);
+      if (k >= 1) { scene.remove(smoke); return false; }
+      return true;
+    });
   }
+
+  // ── Chispas incandescentes (rápidas, vida corta)
+  for (let i = 0; i < 60; i++) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.05 + Math.random() * 0.06, 6, 4), additive(
+      new THREE.Color().setHSL(0.06 + Math.random() * 0.08, 1, 0.55 + Math.random() * 0.3), 1));
+    m.position.copy(origin);
+    const dir = new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.9 + 0.1, Math.random() - 0.5).normalize();
+    scene.add(m);
+    debrisParticles.push({ mesh: m, vel: dir.multiplyScalar(8 + Math.random() * 14), life: 0.6 + Math.random() * 1.2 });
+  }
+
+  // ── Esquirlas de metal y concreto que rebotan y quedan un rato en el piso
+  const shardMats = [
+    new THREE.MeshStandardMaterial({ color: 0x4a4d52, metalness: 0.7, roughness: 0.5 }),
+    new THREE.MeshStandardMaterial({ map: getConcreteTexture(), color: 0x9a9a9a, roughness: 0.95 }),
+  ];
+  for (let i = 0; i < 26; i++) {
+    const shard = new THREE.Mesh(
+      i % 3 === 0
+        ? new THREE.BoxGeometry(0.08, 0.6 + Math.random() * 0.8, 0.08) // Barrotes doblados
+        : new THREE.BoxGeometry(0.2 + Math.random() * 0.4, 0.15 + Math.random() * 0.3, 0.2 + Math.random() * 0.3),
+      shardMats[i % 3 === 0 ? 0 : 1]
+    );
+    shard.castShadow = true;
+    shard.position.copy(origin).add(new THREE.Vector3((Math.random() - 0.5) * GATE_W, Math.random() * 3, 0));
+    scene.add(shard);
+    const vel = new THREE.Vector3((Math.random() - 0.5) * 14, 4 + Math.random() * 8, 2 + Math.random() * 12);
+    const spin = new THREE.Vector3(Math.random() * 10, Math.random() * 10, Math.random() * 10);
+    let life = 7;
+    timedEffects.push(dt => {
+      life -= dt;
+      const half = 0.1;
+      if (shard.position.y > half || vel.y > 0) {
+        vel.y -= 18 * dt;
+        shard.position.addScaledVector(vel, dt);
+        shard.rotation.x += spin.x * dt; shard.rotation.y += spin.y * dt; shard.rotation.z += spin.z * dt;
+        if (shard.position.y < half) {
+          shard.position.y = half;
+          vel.y *= -0.3; vel.x *= 0.6; vel.z *= 0.6; spin.multiplyScalar(0.5);
+          if (Math.abs(vel.y) < 1.2) vel.set(0, 0, 0);
+        }
+      }
+      if (life < 1) shard.scale.setScalar(Math.max(life, 0.001)); // Se achica antes de desaparecer
+      if (life <= 0) { scene.remove(shard); return false; }
+      return true;
+    });
+  }
+
+  // ── Marca quemada en el piso (permanente)
+  const scorch = new THREE.Mesh(
+    new THREE.CircleGeometry(3.2, 32),
+    new THREE.MeshBasicMaterial({ map: getLightPoolTexture(), color: 0x000000, transparent: true, opacity: 0.75, depthWrite: false })
+  );
+  scorch.rotation.x = -Math.PI / 2;
+  scorch.position.set(origin.x, 0.025, origin.z + 0.8);
+  scene.add(scorch);
+
+  cameraShake = 0.9;
+}
+
+function updateTimedEffects(dt) {
+  timedEffects = timedEffects.filter(update => update(dt));
+  if (cameraShake > 0) cameraShake = Math.max(0, cameraShake - dt);
 }
 
 function updateDebris(dt) {
@@ -1694,7 +2441,7 @@ function toggleCamouflage() {
   isCamouflaged = true;
   hasCamoItem = false;
   if (camoBagMesh) {
-    camoBagMesh.position.set(playerPos.x, getGroundHeight(playerPos), playerPos.z);
+    camoBagMesh.position.set(playerPos.x, getGroundHeight(playerPos) + (camoBagMesh.userData.groundOffset || 0), playerPos.z);
     camoBagMesh.rotation.y = playerMesh?.rotation.y ?? 0;
     camoBagMesh.visible = true;
     scene.add(camoBagMesh);
@@ -1791,6 +2538,31 @@ function showMessage(text, duration = 3000) {
 // §14 · INPUT
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/** Panel de volumen (música y efectos), recordado entre partidas. */
+function setupVolumeControls() {
+  const toggle = $('volume-toggle'), panel = $('volume-panel');
+  if (!toggle || !panel) return;
+  toggle.addEventListener('click', () => {
+    panel.hidden = !panel.hidden;
+    toggle.setAttribute('aria-expanded', String(!panel.hidden));
+  });
+  const bind = (id, key, apply) => {
+    const input = $(id);
+    let saved = null;
+    try { saved = localStorage.getItem(key); } catch {}
+    if (saved !== null) input.value = saved;
+    apply(input.value / 100);
+    input.addEventListener('input', () => {
+      apply(input.value / 100);
+      try { localStorage.setItem(key, input.value); } catch {}
+    });
+    // Soltar el foco para que las flechas/WASD vuelvan a mover al personaje
+    input.addEventListener('change', () => input.blur());
+  };
+  bind('volume-music', 'prisonEscape.musicVolume', v => music.setLevel(v));
+  bind('volume-sfx', 'prisonEscape.sfxVolume', v => soundEffects.setLevel(v));
+}
+
 function setupInput() {
   document.addEventListener('keydown', e => {
     if (keys[e.code]) return; // Ignorar tecla repetida
@@ -1867,6 +2639,7 @@ function setupInput() {
   $('music-toggle')?.addEventListener('click', event => {
     music.toggleMute(event.currentTarget);
   });
+  setupVolumeControls();
 
   $('restart-btn')?.addEventListener('click',         () => location.reload());
   $('restart-victory-btn')?.addEventListener('click', () => location.reload());
@@ -2015,6 +2788,8 @@ function animate() {
   updateSpotlights(t);
   updateBombPlacing(dt);
   updateDebris(dt);
+  updateTimedEffects(dt);
+  if (skyClouds) skyClouds.material.map.offset.x += dt * 0.004;
 
   // Parpadeo de la bomba en el suelo
   if (bombPulseLight) bombPulseLight.intensity = 2.5 + Math.sin(t * 6) * 2.2;
@@ -2027,15 +2802,6 @@ function animate() {
     // Halo de la bomba: flota y rota para llamar la atención
     if (item.type === 'bomb' && item.active && item.halo) {
       item.halo.rotation.z += dt * 2.2;
-      item.halo.position.y  = 1.15 + Math.sin(t * 3.5) * 0.12;
-    }
-  });
-
-  // Disco de luz en suelo de reflectores: sigue al target
-  spotRigs.forEach(rig => {
-    if (rig.disc) {
-      rig.disc.position.x = rig.target.position.x;
-      rig.disc.position.z = rig.target.position.z;
     }
   });
 
@@ -2067,6 +2833,17 @@ function animate() {
       `${gs}`;
   }
 
+  // Sacudida de cámara (explosión): desplazamiento temporal sólo para este frame
+  if (cameraShake > 0) {
+    const a = cameraShake * 0.6;
+    const saved = camera.position.clone();
+    camera.position.x += (Math.random() - 0.5) * a;
+    camera.position.y += (Math.random() - 0.5) * a;
+    camera.position.z += (Math.random() - 0.5) * a;
+    renderer.render(scene, camera);
+    camera.position.copy(saved);
+    return;
+  }
   renderer.render(scene, camera);
 }
 

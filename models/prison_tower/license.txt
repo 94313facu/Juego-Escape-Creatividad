@@ -1,0 +1,11 @@
+Model Information:
+* title:	Prison Tower
+* source:	https://sketchfab.com/3d-models/prison-tower-297014fb7169430080905b73249e9db7
+* author:	doktorkto607 (https://sketchfab.com/doktorkto607)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Prison Tower" (https://sketchfab.com/3d-models/prison-tower-297014fb7169430080905b73249e9db7) by doktorkto607 (https://sketchfab.com/doktorkto607) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

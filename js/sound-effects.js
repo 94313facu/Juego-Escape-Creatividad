@@ -29,6 +29,11 @@ export class SoundEffects {
     }
   }
 
+  /** Nivel elegido por el jugador (0–1), relativo a la mezcla de cada efecto. */
+  setLevel(level) {
+    for (const [name, player] of this.players) player.volume = EFFECT_VOLUMES[name] * level;
+  }
+
   play(name) {
     const player = this.players.get(name);
     if (!player) return;

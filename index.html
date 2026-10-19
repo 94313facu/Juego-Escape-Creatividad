@@ -21,6 +21,11 @@
   <canvas id="game-canvas"></canvas>
 
   <button id="music-toggle" type="button" aria-label="Reproducir musica" aria-pressed="false" title="Reproducir musica">▶</button>
+  <button id="volume-toggle" type="button" aria-label="Volumen" aria-expanded="false" title="Volumen">🔊</button>
+  <div id="volume-panel" hidden>
+    <label>Música <input id="volume-music" type="range" min="0" max="100" step="1" value="100"></label>
+    <label>Efectos <input id="volume-sfx" type="range" min="0" max="100" step="1" value="100"></label>
+  </div>
 
   <!-- ═══════════════ PANTALLA DE CARGA ═══════════════ -->
   <div id="loading-screen">
@@ -102,7 +107,7 @@
     <!-- ─── CUENTA ATRÁS DE DETONACIÓN ─── -->
     <div id="bomb-countdown" style="display:none;">
       <div class="bcd-label">💣 DETONACIÓN EN</div>
-      <div id="bomb-count-num">5</div>
+      <div id="bomb-count-num">8</div>
       <div class="bcd-sub">ALÉJATE</div>
     </div>
 

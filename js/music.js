@@ -23,7 +23,8 @@ export class MusicManager {
     this.activePlayer = null;
     this.currentTrack = null;
     this.fadeFrame = 0;
-    this.musicVolume = 0.28;
+    this.baseVolume = 0.28; // Volumen de mezcla al 100% del control del jugador
+    this.musicVolume = this.baseVolume;
     this.muted = false;
     this.playbackPending = false;
     this.playbackError = false;
@@ -71,7 +72,7 @@ export class MusicManager {
     const previousVolume = previousPlayer ? previousPlayer.volume : 0;
     const fade = now => {
       if (this.transitionId !== transitionId) return;
-      const progress = Math.min(1, (now - startTime) / fadeMs);
+      const progress = Math.min(1, Math.max(0, (now - startTime) / fadeMs));
       nextPlayer.volume = progress * this.musicVolume;
       if (previousPlayer) previousPlayer.volume = previousVolume * (1 - progress);
 
@@ -86,6 +87,12 @@ export class MusicManager {
       }
     };
     this.fadeFrame = requestAnimationFrame(fade);
+  }
+
+  /** Nivel elegido por el jugador (0–1), aplicado también a la pista que suena. */
+  setLevel(level) {
+    this.musicVolume = this.baseVolume * level;
+    if (this.activePlayer && !this.fadeFrame) this.activePlayer.volume = this.musicVolume;
   }
 
   toggleMute(button) {
