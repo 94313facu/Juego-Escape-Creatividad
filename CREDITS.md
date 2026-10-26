@@ -15,3 +15,13 @@ Todos los modelos siguientes provienen de Sketchfab y se usan bajo licencia [CC-
 - **Picnic Table** (`models/props/mesa_picnic.glb`) — by [exiS7-Gs](https://sketchfab.com/exiS7-Gs), [Sketchfab](https://sketchfab.com/3d-models/picnic-table-1b11474292aa40adb86a07ba3cb5efcf).
 - **dumpster** (`models/props/contenedor_basura.glb`) — by [YJ_](https://sketchfab.com/YJ_), [Sketchfab](https://sketchfab.com/3d-models/dumpster-989ea7f01b924859b3484ee27103e8d9).
 - **Pull Up Bar** (`models/props/barra_dominadas.glb`) — by [clon6767](https://sketchfab.com/clon6767), [Sketchfab](https://sketchfab.com/3d-models/pull-up-bar-f5b6dc0cd95d4430886ece65096d6f11).
+
+## Poly Haven (CC0)
+
+Los modelos de `models/polyhaven/` provienen de [Poly Haven](https://polyhaven.com) y son de dominio público ([CC0](https://creativecommons.org/publicdomain/zero/1.0/)); se descargaron en versión glTF con texturas de 1k.
+
+- [Old Bed Frame](https://polyhaven.com/a/old_bed_frame) — camas de las celdas.
+- [Metal Office Desk](https://polyhaven.com/a/metal_office_desk) y [Metal Stool 01](https://polyhaven.com/a/metal_stool_01) — puesto de guardia.
+- [Steel Frame Shelves 01](https://polyhaven.com/a/steel_frame_shelves_01) y [Cardboard Box 01](https://polyhaven.com/a/cardboard_box_01) — depósito y lavandería.
+- [Korean Fire Extinguisher 01](https://polyhaven.com/a/korean_fire_extinguisher_01), [Wet Floor Sign 01](https://polyhaven.com/a/WetFloorSign_01) y [Security Camera 01](https://polyhaven.com/a/security_camera_01) — detalles del pabellón.
+- [Mounted Fluorescent Lights](https://polyhaven.com/a/mounted_fluorescent_lights) y [Caged Hanging Light](https://polyhaven.com/a/caged_hanging_light) — lámparas del techo.

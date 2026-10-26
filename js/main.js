@@ -140,6 +140,10 @@ let spotRigs = [];
 let staticColliders = [];
 /** Colliders que también bloquean la visión de guardias y reflectores. */
 let visionOccluders = [];
+/** Cajas que sólo frenan a la cámara (el techo del pabellón: no es piso transitable). */
+let cameraColliders = [];
+/** PointLights del techo del pabellón, en el orden de CEILING_LAMPS. */
+let ceilingLights = [];
 /** @type {Array<Object>} Ítems interactuables en el mundo */
 let worldItems = [];
 
@@ -289,20 +293,32 @@ function tiledBox(w, h, d, tile) {
 // Zonas del patio decoradas con props (ver loadYardProps)
 const COURT_ZONE = { x0: -33.5, x1: -20, z0: -10, z1: 3 }; // Cancha de básquet (oeste, aro contra la pared)
 
-// Pabellón: ocupa la mitad sur del penal (z > BLOCK.zN). De sur a norte: fila de
-// celdas, pasillo principal y, del otro lado, comedor (oeste), duchas, celdas,
-// hall de salida, lavandería y depósito (este). Muros interiores sin techo.
+// Pabellón: ocupa la mitad sur del penal (z > BLOCK.zN), techado. De sur a norte:
+// fila de celdas, pasillo principal y, del otro lado, comedor (oeste), duchas,
+// celdas, puesto de guardia, lavandería y depósito (este). La única salida al
+// patio está al fondo del comedor, en la esquina, detrás de las mesas.
 const BLOCK = {
   zN:      8,     // Fachada norte del pabellón (da al patio)
   zCells:  33,    // Barrotes de la fila de celdas del sur
   zHall:   26,    // Borde norte del pasillo principal
   zRooms:  19,    // Fondo de las celdas del norte / frente de duchas y lavandería
-  H:       4.5,   // Altura de los muros interiores
+  H:       4.5,   // Altura de los muros interiores (y del techo)
   T:       0.5,   // Espesor de los muros interiores
-  doorW:   4,     // Ancho de la puerta del pabellón al patio
+  exitDoor: [-25.5, -21.75], // Puerta del comedor al patio (X), en la fachada norte
   cellW:   7,     // Ancho de cada celda
   playerCellDoor: [2, 5], // Hueco en los barrotes de la celda del jugador (X)
 };
+
+// Lámparas del techo del pabellón: [x, z, modelo]. Cada una lleva una PointLight
+// sin sombras, creada al cargar (ver buildLighting) para no recompilar shaders.
+const CEILING_LAMPS = [
+  [-24, 29.5, 'tube'], [-8, 29.5, 'tube'], [8, 29.5, 'tube'], [24, 29.5, 'tube'], // Pasillo principal
+  [-27.5, 13, 'cage'], [-27.5, 21, 'cage'],                                       // Comedor
+  [27.5, 15, 'cage'],                                                               // Depósito
+  [-14, 13.5, 'tube'], [14, 13.5, 'tube'],                                          // Duchas y lavandería
+  [0, 16, 'tube'],                                                                  // Puesto de guardia
+];
+const FLICKER_LAMP = 3; // Índice de la lámpara del pasillo que parpadea
 
 /** Líneas pintadas en el piso: zona restringida frente a la compuerta y cancha. */
 function buildFloorMarkings() {
@@ -554,16 +570,17 @@ function buildEnvironment() {
   const wallMat = new THREE.MeshStandardMaterial({ map: concreteTex, color: 0xb8bcc4, roughness: 0.95 });
   const capMat  = new THREE.MeshStandardMaterial({ color: 0x4a4d52, roughness: 0.8 });
 
-  function addWall(x, y, z, w, h, d) {
+  function addWall(x, y, z, w, h, d, collide = true) {
     const m = new THREE.Mesh(tiledBox(w, h, d, WALL.H), wallMat);
     m.position.set(x, y, z);
     m.castShadow = m.receiveShadow = true;
     scene.add(m);
-    addStaticCollider(m);
+    if (collide) addStaticCollider(m);
     // Borde superior más claro
     const cap = new THREE.Mesh(new THREE.BoxGeometry(w + 0.1, 0.3, d + 0.1), capMat);
     cap.position.set(x, y + h / 2 + 0.15, z);
     scene.add(cap);
+    return m;
   }
 
   const hw = COURT.W / 2, hd = COURT.D / 2;
@@ -598,19 +615,53 @@ function buildCellBlock(addWall) {
   const wallX = (x1, x2, z) => addWall((x1 + x2) / 2, B.H / 2, z, x2 - x1, B.H, B.T);
   const wallZ = (x, z1, z2) => addWall(x, B.H / 2, (z1 + z2) / 2, B.T, B.H, z2 - z1);
 
-  // Piso del pabellón: concreto alisado, distinto de las losas del patio
+  // Piso del pabellón: concreto gastado de interior, distinto de las losas del patio
+  // Textura: "Concrete Floor Worn 001" de Poly Haven (CC0), repetida cada 3 unidades
+  const floorW = 2 * xIn, floorD = zIn - B.zN, TILE = 3;
+  const loadMap = (file, srgb) => {
+    const t = new THREE.TextureLoader().load('./models/textures/' + file);
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(floorW / TILE, floorD / TILE);
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    return t;
+  };
   const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(2 * xIn, zIn - B.zN),
-    new THREE.MeshStandardMaterial({ color: 0x5c6066, roughness: 0.85 })
+    new THREE.PlaneGeometry(floorW, floorD),
+    new THREE.MeshStandardMaterial({
+      map:          loadMap('floor_inside.jpg', true),
+      normalMap:    loadMap('floor_inside_normal.jpg', false),
+      roughnessMap: loadMap('floor_inside_roughness.jpg', false),
+      color: 0xd0d0d0, roughness: 1, metalness: 0,
+    })
   );
   floor.rotation.x = -Math.PI / 2;
   floor.position.set(0, 0.012, (zIn + B.zN) / 2);
   floor.receiveShadow = true;
   scene.add(floor);
 
-  // Fachada norte con la única puerta hacia el patio
-  wallX(-xIn, -B.doorW / 2, B.zN);
-  wallX(B.doorW / 2, xIn, B.zN);
+  // Fachada norte: la única puerta al patio queda en la esquina del comedor
+  wallX(-xIn, B.exitDoor[0], B.zN);
+  wallX(B.exitDoor[1], xIn, B.zN);
+  // Dintel sobre la puerta, hasta el techo. Sin collider del jugador: a esa
+  // altura getGroundHeight lo tomaría como piso y subiría al jugador al pasar
+  const lintel = addWall((B.exitDoor[0] + B.exitDoor[1]) / 2, B.H - 0.6, B.zN, B.exitDoor[1] - B.exitDoor[0], 1.2, B.T, false);
+  cameraColliders.push(new THREE.Box3().setFromObject(lintel));
+
+  // Techo: losa de concreto sobre todo el pabellón. No es collider del jugador
+  // (getGroundHeight lo tomaría como piso): sólo frena la cámara y la visión.
+  const roofZ0 = B.zN - B.T / 2, roofZ1 = COURT.D / 2;
+  const roofH = 0.4;
+  const roof = new THREE.Mesh(
+    tiledBox(COURT.W, roofH, roofZ1 - roofZ0, WALL.H),
+    new THREE.MeshStandardMaterial({ map: getConcreteTexture(), color: 0x8a8e94, roughness: 0.95 })
+  );
+  roof.position.set(0, B.H + roofH / 2, (roofZ0 + roofZ1) / 2);
+  roof.castShadow = roof.receiveShadow = true;
+  scene.add(roof);
+  const roofBox = new THREE.Box3().setFromObject(roof);
+  cameraColliders.push(roofBox);
+  visionOccluders.push(roofBox);
 
   // Comedor (oeste) y depósito (este): se entra desde el pasillo principal
   const wingX = 21, wingDoor = [25, 30];
@@ -621,7 +672,7 @@ function buildCellBlock(addWall) {
   wallZ(-wingX, B.zN, B.zHall);
   wallZ( wingX, B.zN, B.zHall);
 
-  // Hall de salida (centro): puertas laterales a duchas (oeste) y lavandería (este)
+  // Puesto de guardia (centro, sin salida): puertas laterales a duchas (oeste) y lavandería (este)
   const hallX = 7, sideDoor = [12, 15];
   for (const s of [-1, 1]) {
     wallZ(s * hallX, B.zN, sideDoor[0]);
@@ -694,10 +745,17 @@ function buildLighting() {
   fill.position.set(-20, 30, -30);
   scene.add(fill);
 
-  // ── Luz de acento sobre el pasillo de celdas (sur), donde arranca el jugador ──
-  const startAccent = new THREE.PointLight(0xffe0aa, 4, 22);
-  startAccent.position.set(0, 6, BLOCK.zCells - 2);
-  scene.add(startAccent);
+  // ── Luces del techo del pabellón (los artefactos se cargan en loadInteriorProps) ──
+  // Tubos fluorescentes fríos y lámparas de jaula cálidas, sin sombras
+  for (const [x, z, kind] of CEILING_LAMPS) {
+    const light = kind === 'tube'
+      ? new THREE.PointLight(0xe6efff, 70, 16, 2)
+      : new THREE.PointLight(0xffc98a, 55, 14, 2);
+    light.position.set(x, BLOCK.H - (kind === 'tube' ? 0.3 : 0.9), z);
+    light.userData.baseIntensity = light.intensity;
+    scene.add(light);
+    ceilingLights.push(light);
+  }
 
   // ── Luz de acento roja/naranja en la compuerta norte (objetivo) ───────────────
   const gateAccent = new THREE.PointLight(0xff6622, 8, 22);
@@ -772,12 +830,14 @@ function getCameraAllowedDistance(pivot, dir, maxDist) {
     if (dir.z !== 0) allowed = Math.min(allowed, ((dir.z > 0 ? hz : -hz) - pivot.z) / dir.z);
   }
 
-  // Obstáculos entre el jugador y la cámara
+  // Obstáculos (y el techo del pabellón) entre el jugador y la cámara
   _visionRay.set(pivot, dir);
-  for (const box of staticColliders) {
-    if (box.containsPoint(pivot)) continue; // P. ej. el jugador parado sobre un contenedor
-    const hit = _visionRay.intersectBox(box, _visionHit);
-    if (hit) allowed = Math.min(allowed, hit.distanceTo(pivot) - CAM.wallMargin);
+  for (const list of [staticColliders, cameraColliders]) {
+    for (const box of list) {
+      if (box.containsPoint(pivot)) continue; // P. ej. el jugador parado sobre un contenedor
+      const hit = _visionRay.intersectBox(box, _visionHit);
+      if (hit) allowed = Math.min(allowed, hit.distanceTo(pivot) - CAM.wallMargin);
+    }
   }
 
   return Math.max(allowed, CAM.minDist);
@@ -980,6 +1040,7 @@ async function loadAllModels() {
   for (const [x, z, rotY] of dumpsterSpots) placeProp(dumpster, { x, z, rotY, size: 4 });
 
   await loadYardProps();
+  await loadInteriorProps();
   checkPatrolRoutes();
   checkWalkablePaths();
 
@@ -1016,9 +1077,8 @@ async function loadYardProps() {
   for (const x of [-30.5, -23.5]) {
     placeProp(bleacher, { x, z: c.z0 - 4, rotY: 0, size: 5.5 });                  // Lado norte
   }
-  for (const x of [-29.5, -23.8]) {
-    placeProp(bleacher, { x, z: BLOCK.zN - 2.2, rotY: Math.PI, size: 5.5 });     // Contra la fachada del pabellón
-  }
+  // Contra la fachada del pabellón, sin tapar la puerta del comedor
+  placeProp(bleacher, { x: -30.5, z: BLOCK.zN - 2.2, rotY: Math.PI, size: 5.5 });
   const bench = (await loadGLTF('./models/props/banco.glb')).scene;
   placeProp(bench, { x: -18, z: BLOCK.zN - 1.6, rotY: Math.PI, size: 3.5 });
 
@@ -1032,6 +1092,118 @@ async function loadYardProps() {
     [30, 2, -Math.PI / 2], [-29, -31, 0.4], [29, -27, -0.4],
   ];
   for (const [x, z, rotY] of crateSpots) placeProp(crates, { x, z, rotY, size: 6 });
+}
+
+/** Carga un modelo de Poly Haven (CC0) guardado en models/polyhaven/<id>/. */
+const loadPolyHaven = id => loadGLTF(`./models/polyhaven/${id}/${id}_1k.gltf`).then(g => g.scene);
+
+/** Hace brillar las partes con textura emisiva (tubos y focos de las lámparas). */
+function lightUpEmissive(model, intensity) {
+  model.traverse(o => {
+    if (o.isMesh && o.material.emissiveMap) {
+      o.material.emissive.set(0xffffff);
+      o.material.emissiveIntensity = intensity;
+    }
+  });
+}
+
+// Ambientación del pabellón: modelos de Poly Haven (CC0 — ver CREDITS.md)
+async function loadInteriorProps() {
+  const B = BLOCK;
+  await setProgress(98, 'Amueblando el pabellón...');
+  const ids = [
+    'old_bed_frame', 'metal_office_desk', 'metal_stool_01', 'steel_frame_shelves_01', 'cardboard_box_01',
+    'korean_fire_extinguisher_01', 'WetFloorSign_01', 'security_camera_01', 'mounted_fluorescent_lights', 'caged_hanging_light',
+    'television_02', 'Megaphone_01', 'wall_clock', 'fire_alarm', 'medical_box', 'metal_trash_can', 'plastic_crate_01',
+    'worn_metal_rack', 'hand_truck', 'wheelchair_01', 'trashbag', 'wooden_bucket_01', 'plastic_monobloc_chair_01',
+    'boombox', 'utility_box_01', 'security_camera_02',
+  ];
+  const m = Object.fromEntries(await Promise.all(ids.map(async id => [id, await loadPolyHaven(id)])));
+  const [bed, desk, stool, shelves, box, extinguisher, wetSign, secCam, tubeSet, cage] =
+    ids.slice(0, 10).map(id => m[id]);
+
+  // Pone el objeto a la altura `y` (la base del modelo ya está asentada en 0)
+  const lift = (obj, y) => { obj.position.y += y; return obj; };
+  // Cuelga el objeto del techo: su borde superior toca la losa
+  const hangFromCeiling = (obj, drop = 0) => {
+    obj.updateMatrixWorld(true);
+    obj.position.y += B.H - drop - new THREE.Box3().setFromObject(obj).max.y;
+    return obj;
+  };
+
+  // ── Camas: contra el fondo de cada celda, a lo largo de X ────────────────────
+  const zBackS = COURT.D / 2 - WALL.T / 2;
+  for (let x0 = -35; x0 < 35; x0 += B.cellW) {
+    placeProp(bed, { x: x0 + 2.3, z: zBackS - 0.75, rotY: Math.PI / 2, size: 2 });   // Fila del sur
+  }
+  for (const x0 of [-21, -14, 7, 14]) {
+    placeProp(bed, { x: x0 + 3.5, z: B.zRooms + B.T / 2 + 0.75, rotY: Math.PI / 2, size: 2 }); // Celdas del norte
+  }
+
+  // ── Puesto de guardia: escritorio contra la fachada y una banqueta ──────────
+  placeProp(desk, { x: -2.5, z: B.zN + 1, size: 2 });
+  placeProp(stool, { x: -0.6, z: B.zN + 2.4, size: 0.75, byHeight: true, collide: false });
+
+  // ── Depósito y lavandería: estanterías contra la pared y cajas sueltas ──────
+  placeProp(shelves, { x: COURT.W / 2 - WALL.T / 2 - 0.45, z: 23.5, rotY: Math.PI / 2, size: 2.2, byHeight: true });
+  placeProp(shelves, { x: 21 + B.T / 2 + 0.45, z: 11, rotY: Math.PI / 2, size: 2.2, byHeight: true });
+  for (const [x, z, rotY] of [[22.6, 9.4, 0.2], [23.3, 9.5, -0.4], [22.8, 10.3, 1.1], [33.3, 9.2, 0.5]]) {
+    placeProp(box, { x, z, rotY, size: 0.6, collide: false });
+  }
+
+  // ── Detalles: matafuegos, carteles de piso mojado y cámaras de seguridad ────
+  for (const x of [-33.6, 33.6]) {
+    placeProp(extinguisher, { x, z: B.zHall + 0.6, size: 0.65, byHeight: true, collide: false });
+  }
+  placeProp(wetSign, { x: -11, z: 16.5, rotY: 0.6, size: 0.65, byHeight: true, collide: false });
+  placeProp(wetSign, { x: 12, z: B.zCells - 1.2, rotY: -0.3, size: 0.65, byHeight: true, collide: false });
+  for (const [x, z, rotY] of [[-33.9, 29.5, Math.PI / 2], [33.9, 29.5, -Math.PI / 2], [6.6, 25, -Math.PI * 0.75]]) {
+    hangFromCeiling(placeProp(secCam, { x, z, rotY, size: 0.55, collide: false }), 0.3);
+  }
+  for (const [x, z, rotY] of [[-34.3, 9.2, Math.PI / 2], [34.3, 9.2, -Math.PI / 2], [-6.6, 25, Math.PI * 0.75]]) {
+    hangFromCeiling(placeProp(m.security_camera_02, { x, z, rotY, size: 0.4, collide: false }), 0.3);
+  }
+
+  // ── Puesto de guardia: TV, megáfono, reloj, botiquín y alarma de incendio ───
+  const DESK_TOP = 0.79;
+  lift(placeProp(m.television_02, { x: -3.2, z: B.zN + 1, rotY: 0.15, size: 0.45, collide: false }), DESK_TOP);
+  lift(placeProp(m.Megaphone_01, { x: -1.6, z: B.zN + 1.1, rotY: -0.5, size: 0.32, collide: false }), DESK_TOP);
+  lift(placeProp(m.wall_clock, { x: 2.5, z: B.zN + B.T / 2 + 0.03, size: 0.5, collide: false }), 3);
+  lift(placeProp(m.medical_box, { x: 6.5, z: 20, rotY: -Math.PI / 2, size: 0.5, collide: false }), 1.3);
+  lift(placeProp(m.fire_alarm, { x: 6.7, z: 24, rotY: -Math.PI / 2, size: 0.25, collide: false }), 1.5);
+  placeProp(m.plastic_monobloc_chair_01, { x: -3.8, z: B.zN + 2.6, rotY: 2.7, size: 0.9, byHeight: true, collide: false });
+
+  // ── Pasillo principal y celdas: tachos, silla de ruedas y una radio ─────────
+  for (const [x, z] of [[-30, 27.2], [31, 27.2], [-4, 27.2]]) {
+    placeProp(m.metal_trash_can, { x, z, rotY: x * 0.7, size: 0.9, byHeight: true });
+  }
+  placeProp(m.wheelchair_01, { x: -16, z: 27.4, rotY: 0.5, size: 1.1, byHeight: true });
+  placeProp(m.boombox, { x: -5.4, z: COURT.D / 2 - 1.2, rotY: 0.3, size: 0.6, collide: false });
+  placeProp(m.plastic_monobloc_chair_01, { x: -17.5, z: 23.2, rotY: 2.5, size: 0.9, byHeight: true, collide: false });
+  lift(placeProp(m.fire_alarm, { x: -34.5, z: 27.5, rotY: Math.PI / 2, size: 0.25, collide: false }), 1.5);
+  placeProp(m.utility_box_01, { x: -34.3, z: 31.2, rotY: Math.PI / 2, size: 1.1, byHeight: true });
+
+  // ── Duchas y lavandería: baldes y bolsas de basura ──────────────────────────
+  placeProp(m.wooden_bucket_01, { x: -19.6, z: 9.6, size: 0.45, collide: false });
+  placeProp(m.wooden_bucket_01, { x: -9.4, z: 17.4, rotY: 1, size: 0.45, collide: false });
+  placeProp(m.trashbag, { x: 19.8, z: 9.6, rotY: 0.4, size: 0.65, collide: false });
+  placeProp(m.trashbag, { x: 20.5, z: 10.6, rotY: 2.1, size: 0.55, collide: false });
+
+  // ── Depósito: rack metálico contra el fondo, carretilla y cajas plásticas ───
+  placeProp(m.worn_metal_rack, { x: 27.5, z: B.zN + B.T / 2 + 0.45, size: 1.9, byHeight: true });
+  placeProp(m.hand_truck, { x: 23.2, z: 13.5, rotY: 0.6, size: 1.4, byHeight: true });
+  for (const [x, z, rotY] of [[33.2, 24.3, 0.3], [32.6, 22.9, -0.5], [24.4, 24.8, 1.2]]) {
+    placeProp(m.plastic_crate_01, { x, z, rotY, size: 0.45, collide: false });
+  }
+
+  // ── Artefactos de las lámparas del techo (las PointLights ya existen) ──────
+  lightUpEmissive(tubeSet, 3);
+  lightUpEmissive(cage, 4);
+  for (const [x, z, kind] of CEILING_LAMPS) {
+    hangFromCeiling(kind === 'tube'
+      ? placeProp(tubeSet, { x, z, size: 1.4, collide: false })
+      : placeProp(cage, { x, z, size: 1.1, collide: false }));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2042,6 +2214,15 @@ function updateSpotlights(t) {
   if (gs === GS.PLAYING) checkSpotDetection();
 }
 
+/** Un tubo fluorescente del pasillo falla: se apaga a ratos, en ráfagas cortas. */
+function updateCeilingLights(t) {
+  const light = ceilingLights[FLICKER_LAMP];
+  if (!light) return;
+  const burst = Math.sin(t * 0.7) > 0.75;                  // Ventana de falla cada ~9 s
+  const off = burst && Math.sin(t * 37) * Math.sin(t * 23) > 0.2;
+  light.intensity = off ? 0 : light.userData.baseIntensity;
+}
+
 function checkSpotDetection() {
   // Gracia de inicio — los primeros segundos de juego no hay detección
   if (startupGrace > 0) return;
@@ -2944,6 +3125,7 @@ function animate() {
   // ── Sistemas ───────────────────────────────────────────────────────────────
   updateGuards(dt);
   updateSpotlights(t);
+  updateCeilingLights(t);
   updateBombPlacing(dt);
   updateDebris(dt);
   updateTimedEffects(dt);
