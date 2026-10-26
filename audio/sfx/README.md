@@ -14,7 +14,7 @@ Los efectos se reproducen desde `js/sound-effects.js`. Para reemplazar uno, cons
 | `muerte-policia.mp3` | Al morir el policía (junto con la animación de caída) |
 | `pasos-correr.mp3` | En bucle mientras el policía corre; debe loopear sin corte |
 | `pasos-sigilo.wav` | En bucle mientras avanza agachado; debe loopear sin corte |
-| `derribo-guardia.mp3` | Al neutralizar a un guardia por la espalda |
+| `derribo-guardia.mp3` | Al eliminar a un guardia por la espalda (sólo se puede una vez: el cuchillo se rompe) |
 | `llave-recogida.wav` | Al recoger la llave maestra (reemplaza `item-recogido` solo para la llave) |
 | `aterrizaje.mp3` | Al tocar el suelo después de un salto |
 | `camuflaje.mp3` | Al cubrirse con la bolsa de camuflaje |

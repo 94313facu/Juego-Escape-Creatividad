@@ -16,8 +16,9 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader  } from 'three/addons/loaders/FBXLoader.js';
 import { Sky } from 'three/addons/objects/Sky.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { MusicManager } from './music.js';
-import { SoundEffects } from './sound-effects.js';
+import { SoundEffects, AmbientZones } from './sound-effects.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §1 · CONSTANTES
@@ -65,6 +66,16 @@ const GD = {
   fov:        Math.PI / 3,  // 60° campo de visión
   range:      10,
   backRange:  2.2,          // Distancia para derribo sigiloso
+  hearRun:    9,            // Radio en que oyen correr
+  hearSneak:  1.2,          // Radio en que oyen avanzar agachado (menor que backRange: el derribo no te delata)
+  hearThroughWalls: 0.45,   // Fracción del radio si hay una pared en medio
+  hearTime:   2.2,          // Segundos de ruido seguido hasta que dan la alarma
+  hearTurnSpeed: 3,         // Rad/s con que se dan vuelta hacia el ruido
+  cornerTurnSpeed: 4,       // Rad/s con que giran en las esquinas de la ronda
+  stranglePress: 0.12,      // Progreso del ahorcamiento por cada pulsación de E (~9 pulsaciones, unos 4 s)
+  strangleDecay: 0.18,      // Progreso que se pierde por segundo si dejás de apretar
+  strangleMaxDist: 2.8,     // Si te alejás más que esto del guardia, se zafa
+  hearStrangle: 7,          // Radio en que los otros guardias oyen el forcejeo
 };
 
 // Preguntas de interrogatorio
@@ -130,6 +141,12 @@ let hasCamoItem   = false;
 let camoBagMesh   = null;
 let hasBomb       = false;
 let hasKey        = false;
+let hasKnife      = true;   // Cuchillo improvisado: se rompe tras un solo derribo
+/** Ahorcamiento en curso (sin cuchillo): { g: guardia, progress: 0–1 }. Se llena apretando E. */
+let strangle      = null;
+let hasStorageKey = false;  // Llave del depósito (la suelta el guardia del comedor)
+/** Puerta con candado del depósito: { parts, collider, x, z, open } */
+let storageDoor   = null;
 
 // — Sistemas —
 /** @type {Array<Object>} Objetos Guard */
@@ -162,18 +179,24 @@ let bombPlanted       = false;
 let bombFuseInterval  = null;
 let bombPulseLight    = null;  // PointLight roja parpadeante de la bomba en el suelo
 let keyLight          = null;  // PointLight dorada de la llave (apagada hasta que aparece)
+let storageKeyLight   = null;  // PointLight celeste de la llave del depósito
 let explosionLight    = null;  // PointLight del destello de la explosión (apagada hasta detonar)
 let bombMesh          = null;
 
 // — Compuerta —
 let gateOpen = false;
 let gateMesh = null;
-let gateColliderIdx = -1; // Índice en staticColliders para eliminarla al explotar
+let gateCollider = null;  // Collider de la compuerta (se quita al abrirla o explotarla). Se guarda el
+                          // objeto y no un índice: otros colliders se quitan antes (puerta del depósito)
+// Originales de la compuerta, para volver a armarla al reiniciar sin recargar la página
+let gateModel = null, gateHome = null, gateColliderBox = null;
 
 // — Partículas de explosión —
 let debrisParticles = [];
 let skyClouds       = null; // Capa de nubes (se desplaza lentamente)
 let timedEffects    = []; // Efectos con update(dt) → false cuando terminan (explosión)
+const fxObjects     = []; // Mallas de la explosión (se quitan todas al reiniciar)
+let gameOverTimeout = null; // Pantalla de derrota pendiente (se cancela al reiniciar)
 let cameraShake     = 0;  // Segundos de sacudida de cámara restantes
 
 // — Timers internos —
@@ -190,6 +213,9 @@ const $ = id => document.getElementById(id);
  * Cielo abierto: modelo atmosférico de Three.js (dispersión de Rayleigh/Mie)
  * con el sol alto de media mañana, más una capa de nubes procedural.
  */
+/** Dirección hacia el sol (unitaria): el cielo lo dibuja ahí y los haces de las ventanas se alinean con él. */
+const SUN_DIR = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 35), THREE.MathUtils.degToRad(150));
+
 function buildSky() {
   const sky = new Sky();
   sky.scale.setScalar(250); // Dentro del plano lejano de la cámara (300)
@@ -198,8 +224,7 @@ function buildSky() {
   u.rayleigh.value = 3;
   u.mieCoefficient.value = 0.005;
   u.mieDirectionalG.value = 0.8;
-  const sun = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 35), THREE.MathUtils.degToRad(150));
-  u.sunPosition.value.copy(sun);
+  u.sunPosition.value.copy(SUN_DIR);
   scene.add(sky);
 
   // Nubes: textura de ruido suave pintada en canvas sobre una cúpula plana alta
@@ -307,7 +332,14 @@ const BLOCK = {
   exitDoor: [-25.5, -21.75], // Puerta del comedor al patio (X), en la fachada norte
   cellW:   7,     // Ancho de cada celda
   playerCellDoor: [2, 5], // Hueco en los barrotes de la celda del jugador (X)
+  safeCell: { x0: 0.3, x1: 6.7, z0: 33.4, z1: 39.5 }, // Dentro de la celda del jugador nadie lo detecta
 };
+
+/** ¿Está el jugador dentro de su celda? Ahí no lo detectan guardias, reflectores ni ruido. */
+function isPlayerInSafeCell() {
+  const c = BLOCK.safeCell;
+  return playerPos.x > c.x0 && playerPos.x < c.x1 && playerPos.z > c.z0 && playerPos.z < c.z1;
+}
 
 // Lámparas del techo del pabellón: [x, z, modelo]. Cada una lleva una PointLight
 // sin sombras, creada al cargar (ver buildLighting) para no recompilar shaders.
@@ -319,6 +351,13 @@ const CEILING_LAMPS = [
   [0, 16, 'tube'],                                                                  // Puesto de guardia
 ];
 const FLICKER_LAMP = 3; // Índice de la lámpara del pasillo que parpadea
+
+// Sonido ambiente por zona (ver audio/ambient/README.md): rectángulos del mapa en X/Z
+const ambient = new AmbientZones([
+  { src: './audio/ambient/goteo-duchas.mp3',          x0: -21,    x1: -7,    z0: 8,  z1: 19,   volume: 0.55, fade: 5 },
+  { src: './audio/ambient/murmullo-comedor.mp3',      x0: -34.75, x1: -21,   z0: 8,  z1: 26,   volume: 0.5,  fade: 6 },
+  { src: './audio/ambient/zumbido-fluorescentes.mp3', x0: -34.75, x1: 34.75, z0: 26, z1: 39.75, volume: 0.35, fade: 5 },
+]);
 
 /** Líneas pintadas en el piso: zona restringida frente a la compuerta y cancha. */
 function buildFloorMarkings() {
@@ -575,7 +614,7 @@ function buildEnvironment() {
     m.position.set(x, y, z);
     m.castShadow = m.receiveShadow = true;
     scene.add(m);
-    if (collide) addStaticCollider(m);
+    if (collide) addStaticCollider(m, true);
     // Borde superior más claro
     const cap = new THREE.Mesh(new THREE.BoxGeometry(w + 0.1, 0.3, d + 0.1), capMat);
     cap.position.set(x, y + h / 2 + 0.15, z);
@@ -690,34 +729,128 @@ function buildCellBlock(addWall) {
   addBars(d1, xIn, B.zCells);
   addBars(-wingX, -hallX, B.zHall);
   addBars(hallX, wingX, B.zHall);
+
+  // Puerta con candado del depósito (la bomba está adentro): barrotes rojizos y
+  // un candado. Se abre con la llave del guardia del comedor (ver openStorageDoor).
+  const doorMat = new THREE.MeshStandardMaterial({ color: 0x6b2a22, metalness: 0.6, roughness: 0.5 });
+  const door = addBars(wingDoor[0], wingDoor[1], B.zHall, doorMat);
+  const lock = new THREE.Mesh(
+    new THREE.BoxGeometry(0.28, 0.34, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0xc9a227, metalness: 0.8, roughness: 0.3 })
+  );
+  lock.position.set((wingDoor[0] + wingDoor[1]) / 2, 1.15, B.zHall - 0.12);
+  scene.add(lock);
+  door.parts.push(lock);
+  storageDoor = {
+    ...door, x: (wingDoor[0] + wingDoor[1]) / 2, z: B.zHall, open: false,
+    baseY: door.parts.map(p => p.position.y), // Alturas originales, para volver a cerrarla al reiniciar
+  };
+
+  // Ventanas altas. El sol está al nordeste (SUN_DIR), así que entra luz por las ventanas de la
+  // fachada norte (comedor, duchas y lavandería) y de la pared este (depósito)
+  const yN = B.zN + B.T / 2 + 0.05;
+  buildWindowShaft(-30,   yN, [0, 1]);
+  buildWindowShaft(-27.2, yN, [0, 1]);
+  buildWindowShaft(-14,   yN, [0, 1]);
+  buildWindowShaft( 14,   yN, [0, 1]);
+  buildWindowShaft(xIn - 0.05, 15, [-1, 0]);
+}
+
+/**
+ * Ventana alta pegada a un muro y el haz de sol que entra por ella. El haz sigue la
+ * dirección real del sol (SUN_DIR): cada esquina del vidrio se proyecta al piso a lo largo
+ * del rayo, así que el rectángulo de luz cae corrido y en diagonal. Es sólo un efecto visual
+ * (mallas aditivas, muy tenues): no suma luces a la escena.
+ * @param {number} x,z   Punto del muro donde está el centro de la ventana
+ * @param {number[]} dir Dirección hacia adentro del pabellón (eje X o Z, unitaria)
+ */
+function buildWindowShaft(x, z, dir) {
+  const HALF_W = 0.9, Y1 = 2.9, Y2 = 3.9;
+  const g = new THREE.Group();
+  g.position.set(x, 0, z);
+  g.rotation.y = Math.atan2(dir[0], dir[1]); // El +Z local apunta hacia adentro
+
+  // Vidrio con dos travesaños oscuros
+  const pane = new THREE.Mesh(
+    new THREE.PlaneGeometry(HALF_W * 2, Y2 - Y1),
+    new THREE.MeshBasicMaterial({ color: 0xdbe7f7 })
+  );
+  pane.position.set(0, (Y1 + Y2) / 2, 0.03);
+  g.add(pane);
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x2a2d31, metalness: 0.6, roughness: 0.6 });
+  for (const px of [-HALF_W / 3, HALF_W / 3]) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.05, Y2 - Y1, 0.06), frameMat);
+    bar.position.set(px, (Y1 + Y2) / 2, 0.05);
+    g.add(bar);
+  }
+  const rail = new THREE.Mesh(new THREE.BoxGeometry(HALF_W * 2 + 0.12, 0.06, 0.08), frameMat);
+  for (const py of [Y1 - 0.03, Y2 + 0.03]) {
+    const r = rail.clone();
+    r.position.set(0, py, 0.05);
+    g.add(r);
+  }
+  scene.add(g);
+
+  // Rayo de sol: por cada unidad de altura, se corre (-SUN_DIR.x, -SUN_DIR.z) / SUN_DIR.y en el piso.
+  // Si el sol está del lado de afuera de esta pared, el rayo no entra: sólo queda el vidrio.
+  const dx = -SUN_DIR.x / SUN_DIR.y, dz = -SUN_DIR.z / SUN_DIR.y;
+  if (dir[0] * dx + dir[1] * dz <= 0) return;
+
+  // Esquinas del vidrio en el mundo (tangente a la pared = perpendicular a `dir`) y su proyección al piso
+  const tx = dir[1], tz = -dir[0];
+  const top = [[-HALF_W, Y1], [HALF_W, Y1], [HALF_W, Y2], [-HALF_W, Y2]]
+    .map(([s, y]) => [x + tx * s, y, z + tz * s]);
+  const low = top.map(([wx, y, wz]) => [wx + dx * y, 0.02, wz + dz * y]);
+  const col = [];
+  for (let i = 0; i < 4; i++) col.push(0.8, 0.74, 0.55);    // Junto a la ventana: algo más intenso
+  for (let i = 0; i < 4; i++) col.push(0.3, 0.28, 0.2);     // En el piso: se difumina
+  const idx = [];
+  for (let i = 0; i < 4; i++) { const j = (i + 1) % 4; idx.push(i, j, 4 + i, j, 4 + j, 4 + i); } // Cuatro caras
+  idx.push(4, 5, 6, 4, 6, 7);                                                                     // Mancha en el piso
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute([...top, ...low].flat(), 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  scene.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.13, side: THREE.DoubleSide,
+    depthWrite: false, blending: THREE.AdditiveBlending,
+  })));
 }
 
 /**
  * Reja de barrotes verticales a lo largo de X. Frena al jugador pero no tapa
  * la vista: no se agrega a visionOccluders (los guardias ven dentro de las celdas).
+ * Devuelve las piezas (para poder quitarlas, como en una puerta) y su collider.
  */
-function addBars(x1, x2, z) {
+function addBars(x1, x2, z, mat = null) {
   const H = BLOCK.H, GAP = 0.32;
   const n = Math.max(1, Math.round((x2 - x1) / GAP));
   if (!addBars.mat) addBars.mat = new THREE.MeshStandardMaterial({ color: 0x3b3f45, metalness: 0.7, roughness: 0.45 });
-  const bars = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.035, 0.035, H, 6), addBars.mat, n);
+  mat = mat || addBars.mat;
+  const parts = [];
+  const bars = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.035, 0.035, H, 6), mat, n);
   const m = new THREE.Matrix4();
   for (let i = 0; i < n; i++) {
     bars.setMatrixAt(i, m.makeTranslation(x1 + (i + 0.5) * (x2 - x1) / n, H / 2, z));
   }
   bars.castShadow = true;
   scene.add(bars);
+  parts.push(bars);
 
   // Travesaños arriba, al medio y abajo
   for (const y of [0.15, H * 0.5, H - 0.1]) {
-    const rail = new THREE.Mesh(new THREE.BoxGeometry(x2 - x1, 0.08, 0.1), addBars.mat);
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(x2 - x1, 0.08, 0.1), mat);
     rail.position.set((x1 + x2) / 2, y, z);
     scene.add(rail);
+    parts.push(rail);
   }
 
-  staticColliders.push(new THREE.Box3(
+  const collider = new THREE.Box3(
     new THREE.Vector3(x1, 0, z - 0.1), new THREE.Vector3(x2, H, z + 0.1)
-  ).expandByScalar(0.05));
+  ).expandByScalar(0.05);
+  collider.solid = true; // Las rejas no se pueden trepar
+  staticColliders.push(collider);
+  return { parts, collider };
 }
 
 function buildLighting() {
@@ -766,6 +899,10 @@ function buildLighting() {
   keyLight = new THREE.PointLight(0xffcc00, 0, 6);
   scene.add(keyLight);
 
+  // ── Brillo de la llave del depósito (celeste): apagado hasta que cae del guardia ──
+  storageKeyLight = new THREE.PointLight(0x88ccff, 0, 6);
+  scene.add(storageKeyLight);
+
   // ── Destello de la explosión: apagado hasta que detona la bomba (ver spawnExplosion) ──
   explosionLight = new THREE.PointLight(0xffa040, 0, 60, 1.6);
   scene.add(explosionLight);
@@ -775,7 +912,7 @@ function buildLighting() {
 // §5 · SISTEMA DE COLISIONES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function addStaticCollider(object) {
+function addStaticCollider(object, solid = false) {
   object.updateMatrixWorld(true);
   // Una caja ajustada a los vértices de cada pieza (no una sola caja que envuelva
   // todo el modelo): en modelos girados o con varias piezas la caja global queda
@@ -785,6 +922,7 @@ function addStaticCollider(object) {
     const box = new THREE.Box3().expandByObject(child, true);
     if (box.isEmpty()) return;
     box.expandByScalar(0.05); // Margen mínimo anti-tunneling
+    box.solid = solid;        // true en muros: no se puede subir encima
     staticColliders.push(box);
     visionOccluders.push(box);
   });
@@ -850,8 +988,9 @@ const _push   = new THREE.Vector3();
 function getGroundHeight(pos) {
   let highest = 0;
   for (const box of staticColliders) {
-    // Permitir trepar objetos menores a 7.5u de altura (barreras, cajas, contenedores)
-    if (box.max.y > 7.5) continue;
+    // Permitir trepar objetos menores a 7.5u de altura (barreras, cajas, contenedores),
+    // pero no los muros interiores ni las rejas del pabellón (box.solid)
+    if (box.max.y > 7.5 || box.solid) continue;
     // Dar un leve margen para los pies
     if (pos.x >= box.min.x - 0.2 && pos.x <= box.max.x + 0.2 &&
         pos.z >= box.min.z - 0.2 && pos.z <= box.max.z + 0.2) {
@@ -886,27 +1025,30 @@ function resolveCollisions(pos) {
     new THREE.Vector3(PL.radius * 2, colH, PL.radius * 2)
   );
 
-  for (const box of staticColliders) {
-    // Si la base del jugador (los pies) está por encima o a ras del techo del obstáculo,
-    // ignoramos la colisión lateral para no empujarlo fuera de la caja/contenedor.
-    if (pos.y - colH / 2 >= box.max.y - 0.05) continue;
-    
-    if (!_pAABB.intersectsBox(box)) continue;
-    box.getCenter(_oCenter);
-    _push.set(pos.x - _oCenter.x, 0, pos.z - _oCenter.z);
-    const ex = (box.max.x - box.min.x) / 2 + PL.radius + 0.06;
-    const ez = (box.max.z - box.min.z) / 2 + PL.radius + 0.06;
-    // Empujar por el eje de menor penetración
-    if (Math.abs(_push.x) / ex > Math.abs(_push.z) / ez) {
-      pos.x = _oCenter.x + Math.sign(_push.x) * ex;
-    } else {
-      pos.z = _oCenter.z + Math.sign(_push.z) * ez;
+  // Dos pasadas: al empujar fuera de una caja se puede entrar en otra (esquinas, rejas junto a muros)
+  for (let pass = 0; pass < 2; pass++) {
+    for (const box of staticColliders) {
+      // Si la base del jugador (los pies) está por encima o a ras del techo del obstáculo,
+      // ignoramos la colisión lateral para no empujarlo fuera de la caja/contenedor.
+      if (pos.y - colH / 2 >= box.max.y - 0.05) continue;
+
+      if (!_pAABB.intersectsBox(box)) continue;
+      // Se empuja por el eje y el lado de menor penetración. (Antes se comparaba contra el
+      // centro de la caja: en rejas y muros largos, cerca de un extremo empujaba de costado
+      // en vez de hacia atrás y el jugador quedaba trabado o salía despedido.)
+      const inFromMinX = _pAABB.max.x - box.min.x, inFromMaxX = box.max.x - _pAABB.min.x;
+      const inFromMinZ = _pAABB.max.z - box.min.z, inFromMaxZ = box.max.z - _pAABB.min.z;
+      if (Math.min(inFromMinX, inFromMaxX) < Math.min(inFromMinZ, inFromMaxZ)) {
+        pos.x += inFromMinX < inFromMaxX ? -(inFromMinX + 0.02) : inFromMaxX + 0.02;
+      } else {
+        pos.z += inFromMinZ < inFromMaxZ ? -(inFromMinZ + 0.02) : inFromMaxZ + 0.02;
+      }
+      // Recalcular AABB para siguiente iteración
+      _pAABB.setFromCenterAndSize(
+        new THREE.Vector3(pos.x, colY, pos.z),
+        new THREE.Vector3(PL.radius * 2, colH, PL.radius * 2)
+      );
     }
-    // Recalcular AABB para siguiente iteración
-    _pAABB.setFromCenterAndSize(
-      new THREE.Vector3(pos.x, colY, pos.z),
-      new THREE.Vector3(PL.radius * 2, colH, PL.radius * 2)
-    );
   }
 }
 
@@ -1226,6 +1368,13 @@ function loadFBX(path) {
   });
 }
 
+/** Como loadFBX, pero descarga y procesa cada archivo una sola vez (los 4 guardias comparten modelo y clips). */
+const fbxCache = new Map();
+function loadFBXCached(path) {
+  if (!fbxCache.has(path)) fbxCache.set(path, loadFBX(path));
+  return fbxCache.get(path);
+}
+
 /**
  * Función de transición suave entre animaciones.
  * El personaje no corta bruscamente: hace crossfade en `duration` segundos.
@@ -1482,9 +1631,10 @@ async function setupPlayerFBX() {
 }
 
 async function setupGuardFBX(index) {
-  let base;
+  let template, base;
   try {
-    base = await loadFBX('./models/policia_idle.fbx');
+    template = await loadFBXCached('./models/policia_idle.fbx');
+    base = cloneSkinned(template); // Copia con su propio esqueleto; no se vuelve a descargar
   } catch (e) {
     console.warn('[Guardia] Falló policia_idle.fbx', e);
     return;
@@ -1511,8 +1661,8 @@ async function setupGuardFBX(index) {
   const mixer = new THREE.AnimationMixer(base);
   const actions = {};
 
-  if (base.animations && base.animations.length > 0) {
-    actions['idle'] = mixer.clipAction(base.animations[0]);
+  if (template.animations && template.animations.length > 0) {
+    actions['idle'] = mixer.clipAction(template.animations[0]);
   }
 
   const animFiles = [
@@ -1525,7 +1675,7 @@ async function setupGuardFBX(index) {
 
   for (const { key, file } of animFiles) {
     try {
-      const fbx  = await loadFBX(file);
+      const fbx  = await loadFBXCached(file);
       const clip = fbx.animations[0];
       if (clip) actions[key] = mixer.clipAction(clip);
     } catch (e) {
@@ -1558,8 +1708,8 @@ async function setupGuardFBX(index) {
   }
 
   const route = PATROL_ROUTES[index % PATROL_ROUTES.length];
-  const patrolA = new THREE.Vector3(route.a[0], 0, route.a[1]);
-  const patrolB = new THREE.Vector3(route.b[0], 0, route.b[1]);
+  const points = route.points.map(([x, z]) => new THREE.Vector3(x, 0, z));
+  const patrolA = points[0];
   base.position.copy(patrolA);
 
   const coneRadius = Math.tan(GD.fov / 2) * GD.range;
@@ -1579,18 +1729,45 @@ async function setupGuardFBX(index) {
     turnTimer:   0,
     turnTargetAngle: 0,
     turnStartAngle: 0,
-    patrolA,
-    patrolB,
+    points,                 // Vértices de la ronda; va de punta a punta y vuelve
+    wpTarget:    1,         // Índice del vértice hacia el que camina
+    wpDir:       1,         // 1 = hacia el final de la ronda, -1 = de vuelta
     pos:         patrolA.clone(),
-    patrolDir:   1,       
-    facingAngle: 0,
+    facingAngle: Math.atan2(points[1].x - patrolA.x, points[1].z - patrolA.z),
     alive:       true,
+    carries: index === MASTER_KEY_GUARD ? 'key' : index === STORAGE_KEY_GUARD ? 'storageKey' : null,
+    keyIcon: null,
     coneMesh,
     flashlightTarget
   });
 
   const g = guards[guards.length - 1];
   fadeToGuardAction(g, 'caminar', 0);
+
+  // El guardia de la llave maestra lleva un símbolo de llave flotando encima
+  if (g.carries === 'key') {
+    g.keyIcon = makeKeyIcon();
+    scene.add(g.keyIcon);
+  }
+}
+
+/** Sprite con una llave dorada (se dibuja en un canvas): marca al guardia que lleva la llave de la compuerta. */
+function makeKeyIcon() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(10, 12, 16, 0.65)';
+  ctx.beginPath(); ctx.arc(64, 64, 58, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#ffcc00'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(64, 64, 55, 0, Math.PI * 2); ctx.stroke();
+  ctx.font = '72px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('🗝️', 64, 70);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+  sprite.scale.setScalar(0.85);
+  return sprite;
 }
 
 function fadeToGuardAction(g, name, duration = 0.3, once = false) {
@@ -1636,13 +1813,19 @@ function getLightPoolTexture() {
   return lightPoolTexture;
 }
 
-// Rutas de patrullaje (ida y vuelta). Cada carril pasa libre entre muros, mesas
-// y barreras; checkPatrolRoutes() avisa si un obstáculo nuevo lo pisa.
+// Cada guardia, por índice (ver PATROL_ROUTES), puede llevar una llave. El cuchillo sólo alcanza
+// para uno: hay que elegir entre la llave de la compuerta (ruta sigilo) o la del depósito (ruta bomba).
+const MASTER_KEY_GUARD  = 3; // Guardia del patio: llave de la compuerta (lleva un símbolo de llave encima)
+const STORAGE_KEY_GUARD = 2; // Guardia del comedor: llave del depósito, donde está la bomba
+
+// Rutas de patrullaje: polilíneas que el guardia recorre de punta a punta y vuelve
+// por el mismo camino. Cada tramo pasa libre entre muros, mesas y barreras;
+// checkPatrolRoutes() avisa si un obstáculo nuevo lo pisa.
 const PATROL_ROUTES = [
-  { a: [-31, 29.5], b: [31, 29.5] },   // Pasillo principal del pabellón (el de la llave)
-  { a: [  4,   24], b: [ 4, 10.5] },   // Hall de salida, frente a la puerta al patio
-  { a: [-27.5, 10.5], b: [-27.5, 23.5] }, // Comedor, entre las mesas
-  { a: [-14,  -12], b: [14,  -12] },   // Patio, antes de la zona restringida
+  { points: [[-31, 29.5], [27.5, 29.5], [27.5, 27.7]] },        // Pasillo: de punta a punta y se asoma a la puerta del depósito
+  { points: [[4, 24], [4, 12.5], [-5.5, 12.5]] },                // Puesto de guardia: baja por el hall y cruza hacia el escritorio
+  { points: [[-27.5, 10.5], [-27.5, 24.5], [-32, 24.5]] },       // Comedor: entre las mesas y hasta el rincón del fondo
+  { points: [[-16, -12], [2, -12], [2, -19]] },                  // Patio: cruza antes de la zona restringida y avanza hacia la compuerta
 ];
 
 /**
@@ -1653,8 +1836,9 @@ function checkWalkablePaths() {
   const STEP = 0.5, R = PL.radius + 0.06;
   const hw = COURT.W / 2 - WALL.T - PL.radius, hd = COURT.D / 2 - WALL.T - PL.radius;
   const nx = Math.floor((2 * hw) / STEP) + 1, nz = Math.floor((2 * hd) / STEP) + 1;
-  const gateBox = staticColliders[gateColliderIdx];
-  const free = (x, z) => !staticColliders.some(box => box !== gateBox && box.max.y > 0.4 &&
+  const gateBox = gateCollider;
+  const doorBox = storageDoor && storageDoor.collider; // Se abre con llave: no cuenta como obstáculo
+  const free = (x, z) => !staticColliders.some(box => box !== gateBox && box !== doorBox && box.max.y > 0.4 &&
     x > box.min.x - R && x < box.max.x + R && z > box.min.z - R && z < box.max.z + R);
   const cell = (x, z) => [Math.round((x + hw) / STEP), Math.round((z + hd) / STEP)];
   const [sx, sz] = cell(playerPos.x, playerPos.z);
@@ -1703,16 +1887,19 @@ function checkPatrolRoutes() {
   const GUARD_R = 0.45;
   const p = new THREE.Vector3();
   PATROL_ROUTES.forEach((r, i) => {
-    const a = new THREE.Vector3(r.a[0], 0.5, r.a[1]), b = new THREE.Vector3(r.b[0], 0.5, r.b[1]);
-    const steps = Math.ceil(a.distanceTo(b) / 0.25);
-    for (let k = 0; k <= steps; k++) {
-      p.lerpVectors(a, b, k / steps);
-      const hit = staticColliders.find(box => box.max.y < 9 &&
-        p.x > box.min.x - GUARD_R && p.x < box.max.x + GUARD_R &&
-        p.z > box.min.z - GUARD_R && p.z < box.max.z + GUARD_R);
-      if (hit) {
-        console.warn(`Ruta de guardia ${i} atraviesa un obstáculo en (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`);
-        return;
+    for (let s = 0; s < r.points.length - 1; s++) {
+      const a = new THREE.Vector3(r.points[s][0], 0.5, r.points[s][1]);
+      const b = new THREE.Vector3(r.points[s + 1][0], 0.5, r.points[s + 1][1]);
+      const steps = Math.ceil(a.distanceTo(b) / 0.25);
+      for (let k = 0; k <= steps; k++) {
+        p.lerpVectors(a, b, k / steps);
+        const hit = staticColliders.find(box => box.max.y < 9 &&
+          p.x > box.min.x - GUARD_R && p.x < box.max.x + GUARD_R &&
+          p.z > box.min.z - GUARD_R && p.z < box.max.z + GUARD_R);
+        if (hit) {
+          console.warn(`Ruta de guardia ${i} atraviesa un obstáculo en (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`);
+          return;
+        }
       }
     }
   });
@@ -1870,15 +2057,16 @@ function setupGate(gltf) {
   scene.add(model);
   // "Prison Gate" de exiS7-Gs (Sketchfab, CC-BY-4.0)
   // Collider simple y delgado: el tamaño del asset no debe crear una pared invisible.
-  const gateCollider = new THREE.Box3(
+  gateCollider = new THREE.Box3(
     new THREE.Vector3(-GATE_W / 2, 0, gateZ - 0.55),
     new THREE.Vector3( GATE_W / 2, WALL.H, gateZ + 0.55)
   ).expandByScalar(0.05);
   staticColliders.push(gateCollider);
   visionOccluders.push(gateCollider);
-  // Guardamos índice para eliminar el colisionador al abrir/explotar la puerta
-  gateColliderIdx = staticColliders.length - 1;
   gateMesh = model;
+  gateModel = model;
+  gateColliderBox = gateCollider;
+  gateHome = { position: model.position.clone(), rotation: model.rotation.clone(), scale: model.scale.clone() };
 
   // ── Cartel flotante «SALIDA BLINDADA» sobre la compuerta ──────────────────
   // Usamos un sprite con canvas 2D para máxima compatibilidad
@@ -1950,6 +2138,8 @@ function setupBombPickup(gltf) {
     type: 'bomb', mesh: model, halo,
     extras: [halo, arrowStem, arrowTip], // Se quitan al recogerla
     pos: pos.clone(), active: true, label: '[ E ] Recoger BOMBA',
+    light: pl, lightIntensity: pl.intensity,
+    home: { position: model.position.clone(), rotation: model.rotation.clone() }, // Para reiniciar
   });
 }
 
@@ -1977,7 +2167,11 @@ function setupCamoPickup(gltf) {
   scene.add(markerLight);
 
   camoBagMesh = model;
-  worldItems.push({ type: 'camo', mesh: model, marker, markerLight, pos: pos.clone(), active: true, label: '[ E ] Recoger Bolsa de camuflaje' });
+  worldItems.push({
+    type: 'camo', mesh: model, marker, markerLight, pos: pos.clone(), active: true, label: '[ E ] Recoger Bolsa de camuflaje',
+    lightIntensity: markerLight.intensity,
+    home: { position: model.position.clone(), rotation: model.rotation.clone() }, // Para reiniciar
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1986,11 +2180,64 @@ function setupCamoPickup(gltf) {
 
 const _gFwd   = new THREE.Vector3();
 const _gToPlr = new THREE.Vector3();
+const _gEye   = new THREE.Vector3();
+let noiseMsgCooldown = 0; // Segundos hasta poder avisar de nuevo que te oyeron
+
+/** Radio en el que un guardia oye al jugador: correr hace ruido, agachado casi nada, quieto nada. */
+function playerNoiseRadius() {
+  if (strangle) return GD.hearStrangle; // El forcejeo se oye aunque estés quieto
+  if (isCamouflaged || _mv.lengthSq() < 1e-5) return 0;
+  return isCrouching ? GD.hearSneak : GD.hearRun;
+}
+
+/**
+ * ¿El guardia `g` oye al jugador? Acumula sospecha mientras lo oye (y la baja
+ * cuando deja de oírlo); si llega a 1, da la alarma aunque no lo haya visto.
+ * Las paredes amortiguan el ruido: el radio se reduce si no hay línea de visión.
+ */
+function updateGuardHearing(g, dt) {
+  if (gs !== GS.PLAYING || startupGrace > 0 || isPlayerInSafeCell()) { g.suspicion = 0; return false; }
+  const radius = playerNoiseRadius();
+  let heard = false;
+  if (radius > 0) {
+    _gToPlr.subVectors(playerPos, g.pos).setY(0);
+    const dist = _gToPlr.length();
+    if (dist < radius) {
+      _gEye.set(g.pos.x, g.pos.y + 1.45, g.pos.z);
+      heard = dist < (hasClearLineOfSight(_gEye, playerPos) ? radius : radius * GD.hearThroughWalls);
+    }
+  }
+  if (heard) {
+    g.suspicion = (g.suspicion || 0) + dt / GD.hearTime;
+    if (noiseMsgCooldown <= 0) {
+      showMessage('👂 Un guardia te oyó. ¡Agáchate o quédate quieto!', 2200);
+      noiseMsgCooldown = 5;
+    }
+    if (g.suspicion >= 1) triggerAlert('noise');
+  } else {
+    g.suspicion = Math.max(0, (g.suspicion || 0) - dt * 0.5);
+  }
+  return heard;
+}
+
+/** El guardia deja de patrullar y gira hacia el jugador (así, si lo ve, lo detecta por visión). */
+function listenToPlayer(g, dt) {
+  if (!g.listening) { g.listening = true; fadeToGuardAction(g, 'idle', 0.2); }
+  _gToPlr.subVectors(playerPos, g.pos);
+  const target = Math.atan2(_gToPlr.x, _gToPlr.z);
+  let diff = target - g.facingAngle;
+  while (diff >  Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  g.facingAngle += THREE.MathUtils.clamp(diff, -GD.hearTurnSpeed * dt, GD.hearTurnSpeed * dt);
+  g.model.rotation.y = g.facingAngle;
+}
 
 function updateGuards(dt) {
+  noiseMsgCooldown = Math.max(0, noiseMsgCooldown - dt);
   guards.forEach(g => {
     if (!g.alive) return;
     if (g.mixer) g.mixer.update(dt);
+    if (g.keyIcon) g.keyIcon.position.set(g.pos.x, 2.55 + Math.sin(performance.now() / 400) * 0.08, g.pos.z);
 
     // Si el jugador es descubierto, apuntarle a la cabeza
     if (gs === GS.ALERTED || gs === GS.INTERROGATION) {
@@ -2008,6 +2255,12 @@ function updateGuards(dt) {
       fadeToGuardAction(g, 'caminar', 0.4);
     }
 
+    // Ahorcado por el jugador: no patrulla, no ve ni oye (ver updateStrangle)
+    if (g.strangled) {
+      updateGuardCone(g);
+      return;
+    }
+
     // Máquina de estados: Girando
     if (g.state === 'turning') {
       g.turnTimer -= dt;
@@ -2018,7 +2271,8 @@ function updateGuards(dt) {
       if (g.turnTimer <= 0) {
         // Fin de la animación
         g.state = 'patrol';
-        g.patrolDir *= -1;
+        g.wpDir *= -1;
+        g.wpTarget += g.wpDir; // Vuelve por la ronda hacia el vértice anterior
         g.facingAngle = g.turnTargetAngle;
         g.model.rotation.y = g.facingAngle; 
         fadeToGuardAction(g, 'caminar', 0.2);
@@ -2037,26 +2291,41 @@ function updateGuards(dt) {
       return;
     }
 
-    // Máquina de estados: Patrullando
-    if (g.state === 'patrol') {
-      const tgt = g.patrolDir === 1 ? g.patrolB : g.patrolA;
+    // Oído: si te oyen, el guardia se frena y se da vuelta hacia el ruido
+    const heard = g.state === 'patrol' && updateGuardHearing(g, dt);
+    if (heard) {
+      listenToPlayer(g, dt);
+    } else if (g.state === 'patrol') {
+      // Máquina de estados: Patrullando
+      if (g.listening) { g.listening = false; fadeToGuardAction(g, 'caminar', 0.3); }
+      const tgt = g.points[g.wpTarget];
       const dir = new THREE.Vector3().subVectors(tgt, g.pos);
       dir.y = 0;
       const distTgt = dir.length();
       dir.normalize();
 
-      g.facingAngle = Math.atan2(dir.x, dir.z);
+      // En las esquinas de la ronda gira de a poco (no de golpe) hacia el siguiente vértice
+      let diff = Math.atan2(dir.x, dir.z) - g.facingAngle;
+      while (diff >  Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      g.facingAngle += THREE.MathUtils.clamp(diff, -GD.cornerTurnSpeed * dt, GD.cornerTurnSpeed * dt);
       g.pos.addScaledVector(dir, GD.speed * dt);
       g.pos.y = 0;
       g.model.position.copy(g.pos);
       g.model.rotation.y = g.facingAngle; // Orientación normal FBX
 
       if (distTgt < 0.6) {
-        g.state = 'turning';
-        g.turnTimer = 1.3; // Segundos que dura aprox la animación de giro 180
-        g.turnStartAngle = g.facingAngle;
-        g.turnTargetAngle = g.facingAngle + Math.PI;
-        fadeToGuardAction(g, 'girar_180', 0.2, true);
+        const last = g.points.length - 1;
+        if ((g.wpDir === 1 && g.wpTarget === last) || (g.wpDir === -1 && g.wpTarget === 0)) {
+          // Punta de la ronda: da media vuelta
+          g.state = 'turning';
+          g.turnTimer = 1.3; // Segundos que dura aprox la animación de giro 180
+          g.turnStartAngle = g.facingAngle;
+          g.turnTargetAngle = g.facingAngle + Math.PI;
+          fadeToGuardAction(g, 'girar_180', 0.2, true);
+        } else {
+          g.wpTarget += g.wpDir; // Esquina intermedia: sigue al próximo vértice
+        }
       }
     }
 
@@ -2095,7 +2364,7 @@ function updateGuardCone(g) {
 
 function checkGuardDetection(g) {
   // Gracia de inicio — los primeros segundos de juego no hay detección
-  if (startupGrace > 0) return;
+  if (startupGrace > 0 || isPlayerInSafeCell()) return;
   // La bolsa convierte al jugador en un desecho inmóvil que los guardias ignoran.
   if (isCamouflaged && playerVelocity.lengthSq() < 0.01) return;
 
@@ -2121,7 +2390,11 @@ function checkGuardDetection(g) {
  * Condiciones: agachado + por detrás (>120°) + dentro del radio de backRange.
  */
 function isStealthKillPossible(g) {
-  if (!g || !g.alive) return false;
+  return hasKnife && g && g.alive && isBehindGuard(g);
+}
+
+/** ¿Está el jugador agachado, pegado a la espalda del guardia `g`? */
+function isBehindGuard(g) {
   _gFwd.set(Math.sin(g.facingAngle), 0, Math.cos(g.facingAngle));
   _gToPlr.subVectors(playerPos, g.pos).setY(0);
   const dist = _gToPlr.length();
@@ -2129,6 +2402,60 @@ function isStealthKillPossible(g) {
   _gToPlr.normalize();
   const angle = _gFwd.angleTo(_gToPlr);
   return angle > (Math.PI * 2 / 3) && isCrouching;
+}
+
+/** Empieza a ahorcar al guardia `g` (por la espalda, agachado y sin cuchillo). */
+function startStrangle(g) {
+  strangle = { g, progress: GD.stranglePress };
+  g.strangled = true;
+  fadeToGuardAction(g, 'idle', 0.2);
+  soundEffects.play('camoOn'); // Roce de ropa: el forcejeo
+  const ui = $('strangle-ui');
+  if (ui) ui.style.display = 'flex';
+  showMessage('🫳 ¡Aprieta E repetidamente para ahorcarlo! Si paras o te alejas, se zafa y da la alarma.', 3500);
+}
+
+/** Termina el ahorcamiento (con éxito, se zafó o se canceló) y suelta al guardia. */
+function endStrangle() {
+  if (!strangle) return;
+  const g = strangle.g;
+  g.strangled = false;
+  if (g.alive) { g.activeAction = null; fadeToGuardAction(g, 'caminar', 0.3); }
+  strangle = null;
+  const ui = $('strangle-ui');
+  if (ui) ui.style.display = 'none';
+}
+
+/**
+ * Cada cuadro: la barra se vacía sola (hay que seguir apretando E). Si llega a 1 el guardia
+ * cae; si llega a 0, te levantás o te alejás, se zafa y da la alarma.
+ */
+function updateStrangle(dt) {
+  if (!strangle) return;
+  const g = strangle.g;
+  if ((gs !== GS.PLAYING && gs !== GS.GRACE) || !g.alive) { endStrangle(); return; }
+
+  // Primero se comprueba si ya está completo: la pulsación lo deja en 1 y, si se restara
+  // antes, quedaría siempre un poco por debajo y nunca terminaría
+  if (strangle.progress < 1) strangle.progress -= GD.strangleDecay * dt;
+  if (strangle.progress >= 1) {
+    endStrangle();
+    killGuard(g);
+    soundEffects.play('land'); // El cuerpo cae
+    const loot = g.carries === 'storageKey' ? ' Soltó la llave del depósito.'
+      : g.carries === 'key' ? ' Soltó la llave de la compuerta.' : ' No llevaba ninguna llave.';
+    showMessage(`Guardia ahorcado.${loot}`, 4000);
+    return;
+  }
+  const dist = Math.hypot(playerPos.x - g.pos.x, playerPos.z - g.pos.z);
+  if (strangle.progress <= 0 || !isCrouching || dist > GD.strangleMaxDist) {
+    endStrangle();
+    showMessage('¡El guardia se zafó y gritó!', 2500);
+    triggerAlert('guard');
+    return;
+  }
+  const fill = $('strangle-progress-fill');
+  if (fill) fill.style.width = (strangle.progress * 100) + '%';
 }
 
 function killGuard(g) {
@@ -2140,15 +2467,21 @@ function killGuard(g) {
   // Detener animación de caminata
   if (g.animWalk) g.animWalk.stop();
   if (g.animIdle) g.animIdle.play();
-  // Soltar llave maestra
-  spawnKey(g.pos.clone());
+  // El cuchillo improvisado se rompe: es el único derribo de la partida
+  hasKnife = false;
+  if (g.keyIcon) { scene.remove(g.keyIcon); g.keyIcon = null; }
+  // Soltar su llave, si la lleva (sólo dos guardias llevan una)
+  if (g.carries) spawnKey(g.pos.clone(), g.carries);
+  updateHUD();
 }
 
-function spawnKey(pos) {
-  // Toro dorado como representación de la llave
+/** @param {'key'|'storageKey'} type  key = llave maestra (compuerta); storageKey = puerta del depósito */
+function spawnKey(pos, type = 'key') {
+  const isStorage = type === 'storageKey';
+  // Toro como representación de la llave: dorado (maestra) o plateado (depósito)
   const keyMesh = new THREE.Mesh(
     new THREE.TorusGeometry(0.22, 0.055, 8, 16),
-    new THREE.MeshStandardMaterial({ color: 0xffcc00, metalness: 0.85, roughness: 0.15 })
+    new THREE.MeshStandardMaterial({ color: isStorage ? 0xbfd2e0 : 0xffcc00, metalness: 0.85, roughness: 0.15 })
   );
   keyMesh.position.set(pos.x, 0.32, pos.z + 0.6);
   keyMesh.rotation.x = Math.PI / 2;
@@ -2156,14 +2489,39 @@ function spawnKey(pos) {
 
   // Se reutiliza la luz creada (apagada) en buildLighting: agregar una luz nueva
   // a mitad de partida recompila los shaders y congela el juego un instante
-  keyLight.position.copy(keyMesh.position);
-  keyLight.intensity = 5;
+  const light = isStorage ? storageKeyLight : keyLight;
+  light.position.copy(keyMesh.position);
+  light.intensity = 5;
 
   worldItems.push({
-    type: 'key', mesh: keyMesh, markerLight: keyLight,
+    type, mesh: keyMesh, markerLight: light,
     pos:  keyMesh.position.clone(),
     active: true,
-    label: '[ E ] Recoger Llave Maestra',
+    label: isStorage ? '[ E ] Recoger Llave del Depósito' : '[ E ] Recoger Llave Maestra',
+  });
+}
+
+/** ¿Está el jugador frente a la puerta con candado del depósito (cerrada)? */
+function isPlayerNearStorageDoor() {
+  return storageDoor && !storageDoor.open &&
+    Math.hypot(playerPos.x - storageDoor.x, playerPos.z - storageDoor.z) < 3;
+}
+
+/** Abre la puerta del depósito: la reja sube hasta el techo y deja de ser obstáculo. */
+function openStorageDoor() {
+  const door = storageDoor;
+  door.open = true;
+  soundEffects.play('gateOpen');
+  const idx = staticColliders.indexOf(door.collider);
+  if (idx >= 0) staticColliders.splice(idx, 1);
+  const baseY = door.baseY;
+  let t = 0;
+  timedEffects.push(dt => {
+    t += dt;
+    const k = Math.min(t / 0.9, 1);
+    door.parts.forEach((p, i) => { p.position.y = baseY[i] + BLOCK.H * k; });
+    if (k >= 1) { door.parts.forEach(p => scene.remove(p)); return false; }
+    return true;
   });
 }
 
@@ -2173,6 +2531,8 @@ function spawnKey(pos) {
 
 const _sDir   = new THREE.Vector3();
 const _sToPlr = new THREE.Vector3();
+/** Velocidad del barrido de los reflectores (1 = la original). Más bajo = más fácil cruzar el patio. */
+const SPOT_SWEEP_SPEED = 0.6;
 
 function updateSpotlights(t) {
   const isTracking = (gs === GS.ALERTED || gs === GS.INTERROGATION);
@@ -2186,8 +2546,8 @@ function updateSpotlights(t) {
     } else {
       // — Barrido senoidal orgánico (suma de dos frecuencias) —
       // Sólo recorre el patio (z ≈ -30 a 0): el pabellón queda fuera del barrido
-      const sx = Math.sin(t * 0.38 + rig.phase) * 20 - rig.tx * 0.6;
-      const sz = Math.sin(t * 0.22 + rig.phase + 1.4) * 15 + 19;
+      const sx = Math.sin(t * SPOT_SWEEP_SPEED * 0.38 + rig.phase) * 20 - rig.tx * 0.6;
+      const sz = Math.sin(t * SPOT_SWEEP_SPEED * 0.22 + rig.phase + 1.4) * 15 + 19;
       rig.target.position.set(rig.tx + sx, 0, rig.tz + sz);
       rig.spot.color.set(0xffee88);
       rig.spot.intensity = 650;
@@ -2225,7 +2585,7 @@ function updateCeilingLights(t) {
 
 function checkSpotDetection() {
   // Gracia de inicio — los primeros segundos de juego no hay detección
-  if (startupGrace > 0) return;
+  if (startupGrace > 0 || isPlayerInSafeCell()) return;
   // La bolsa oculta al jugador de los reflectores mientras permanece inmóvil.
   if (isCamouflaged && playerVelocity.lengthSq() < 0.01) return;
 
@@ -2344,6 +2704,7 @@ function triggerGameOver() {
   music.play('gameover', { loop: false, fadeMs: 500 });
   soundEffects.play('capture');
   soundEffects.stopLoop();
+  ambient.stop();
   soundEffects.play('death');
   isDead = true;
   fadeToAction('morir', 0.1, true); // Transición rápida a morir
@@ -2354,7 +2715,7 @@ function triggerGameOver() {
     flash.style.opacity    = '1';
   }
   // Retrasamos la pantalla para ver la animación
-  setTimeout(() => {
+  gameOverTimeout = setTimeout(() => {
     const screen = $('gameover-screen');
     if (screen) screen.style.display = 'flex';
   }, 2200);
@@ -2364,6 +2725,7 @@ function triggerVictory(route) {
   if (gs === GS.VICTORY) return;
   gs = GS.VICTORY;
   soundEffects.stopLoop();
+  ambient.stop();
   music.play(route === 'bomb' ? 'victoryBomb' : 'victoryStealth', { loop: false, fadeMs: 700 });
   const msg = $('victory-message');
   if (msg) {
@@ -2394,13 +2756,31 @@ function checkVictoryCondition() {
 function handleInteract() {
   if (gs !== GS.PLAYING && gs !== GS.GRACE) return;
 
+  // Ahorcando a un guardia: cada pulsación de E aprieta un poco más
+  if (strangle) {
+    strangle.progress = Math.min(1, strangle.progress + GD.stranglePress);
+    return;
+  }
+
   // 1. Derribo sigiloso
   for (const g of guards) {
     if (isStealthKillPossible(g)) {
       killGuard(g);
       soundEffects.play('guardTakedown');
-      showMessage('👊 Guardia noqueado de un golpe. ¡Busca la llave!', 2800);
+      const broke = 'Tu cuchillo se rompió: desde ahora sólo puedes ahorcar (E repetidamente, lento y arriesgado).';
+      showMessage(g.carries === 'storageKey'
+        ? `🔪 Guardia eliminado: soltó la llave del depósito. ${broke}`
+        : g.carries === 'key'
+          ? `🔪 Guardia eliminado: soltó la llave de la compuerta. ${broke}`
+          : `🔪 Ese guardia no llevaba ninguna llave. ${broke}`, 5500);
       return;
+    }
+  }
+
+  // Sin cuchillo: ahorcar al guardia por la espalda apretando E repetidamente
+  if (!hasKnife) {
+    for (const g of guards) {
+      if (g.alive && isBehindGuard(g)) { startStrangle(g); return; }
     }
   }
 
@@ -2413,7 +2793,20 @@ function handleInteract() {
   }
   if (nearest) { pickupItem(nearest); return; }
 
-  // 3. Compuerta (abrirla con llave)
+  // 3. Puerta con candado del depósito
+  if (isPlayerNearStorageDoor()) {
+    if (hasStorageKey) {
+      hasStorageKey = false;
+      openStorageDoor();
+      showMessage('🔓 Depósito abierto. La bomba debe estar ahí dentro.', 3000);
+      updateHUD();
+    } else {
+      showMessage('🔒 La puerta del depósito tiene candado. El guardia del comedor lleva la llave.', 3200);
+    }
+    return;
+  }
+
+  // 4. Compuerta (abrirla con llave)
   if (isPlayerNearGate()) {
     if (hasKey && !gateOpen) {
       openGateWithKey();
@@ -2427,7 +2820,7 @@ function handleInteract() {
 
 function pickupItem(item) {
   item.active = false;
-  soundEffects.play(item.type === 'key' ? 'keyPickup' : 'pickup');
+  soundEffects.play(item.type === 'key' || item.type === 'storageKey' ? 'keyPickup' : 'pickup');
   scene.remove(item.mesh);
   if (item.marker) scene.remove(item.marker);
   // Las luces se apagan en vez de quitarse: cambiar la cantidad de luces de la
@@ -2451,6 +2844,10 @@ function pickupItem(item) {
     case 'key':
       hasKey = true;
       showMessage('🗝️ Llave obtenida. Ve a la compuerta del norte y pulsa [ E ].', 3500);
+      break;
+    case 'storageKey':
+      hasStorageKey = true;
+      showMessage('🔑 Llave del depósito. Abre el candado de la puerta de barrotes rojos.', 3500);
       break;
   }
   updateHUD();
@@ -2536,12 +2933,7 @@ function detonateGate() {
 
   // La puerta sale despedida hacia afuera dando vueltas; su colisionador se quita ya
   if (gateMesh) { launchGate(gateMesh); gateMesh = null; }
-  if (gateColliderIdx >= 0) {
-    const [removedCollider] = staticColliders.splice(gateColliderIdx, 1);
-    const occluderIndex = visionOccluders.indexOf(removedCollider);
-    if (occluderIndex >= 0) visionOccluders.splice(occluderIndex, 1);
-    gateColliderIdx = -1;
-  }
+  removeGateCollider();
   gateOpen = true;
 
   spawnExplosion(new THREE.Vector3(0, 1.2, -COURT.D / 2 + 1.8));
@@ -2563,17 +2955,22 @@ function openGateWithKey() {
         clearInterval(iv);
         scene.remove(gateMesh);
         gateMesh = null;
-        if (gateColliderIdx >= 0) {
-          const [removedCollider] = staticColliders.splice(gateColliderIdx, 1);
-          const occluderIndex = visionOccluders.indexOf(removedCollider);
-          if (occluderIndex >= 0) visionOccluders.splice(occluderIndex, 1);
-          gateColliderIdx = -1;
-        }
+        removeGateCollider();
       }
     }, 16);
   }
   gateOpen = true;
   showMessage('🗝️ Compuerta abierta silenciosamente. ¡Escapa ahora!', 3000);
+}
+
+/** Quita el collider de la compuerta (y su bloqueo de visión) para que se pueda cruzar. */
+function removeGateCollider() {
+  if (!gateCollider) return;
+  for (const list of [staticColliders, visionOccluders]) {
+    const i = list.indexOf(gateCollider);
+    if (i >= 0) list.splice(i, 1);
+  }
+  gateCollider = null;
 }
 
 // ─── Partículas de explosión ──────────────────────────────────────────────────
@@ -2595,6 +2992,12 @@ function launchGate(gate) {
   });
 }
 
+/** Agrega a la escena una malla de la explosión y la registra para quitarla al reiniciar. */
+function addFx(object) {
+  scene.add(object);
+  fxObjects.push(object);
+}
+
 /** Explosión de la compuerta: fuego, onda, humo, chispas, esquirlas, luz y sacudida. */
 function spawnExplosion(origin) {
   const additive = (color, opacity) => new THREE.MeshBasicMaterial({
@@ -2605,7 +3008,7 @@ function spawnExplosion(origin) {
   [[0xfff1a0, 0.95, 4.5, 0.45], [0xff6a10, 0.8, 7, 0.8]].forEach(([color, op, maxR, dur]) => {
     const ball = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), additive(color, op));
     ball.position.copy(origin);
-    scene.add(ball);
+    addFx(ball);
     let t = 0;
     timedEffects.push(dt => {
       t += dt;
@@ -2622,7 +3025,7 @@ function spawnExplosion(origin) {
   ring.material.side = THREE.DoubleSide;
   ring.rotation.x = -Math.PI / 2;
   ring.position.set(origin.x, 0.05, origin.z);
-  scene.add(ring);
+  addFx(ring);
   let rt = 0;
   timedEffects.push(dt => {
     rt += dt;
@@ -2649,7 +3052,7 @@ function spawnExplosion(origin) {
       new THREE.MeshBasicMaterial({ color: 0x3a3836, transparent: true, opacity: 0, depthWrite: false })
     );
     smoke.position.copy(origin).add(new THREE.Vector3((Math.random() - 0.5) * 3, Math.random() * 1.5, (Math.random() - 0.5) * 2));
-    scene.add(smoke);
+    addFx(smoke);
     const rise = new THREE.Vector3((Math.random() - 0.5) * 0.8, 1.5 + Math.random() * 1.8, (Math.random() - 0.5) * 0.8);
     const delay = 0.15 + Math.random() * 0.5, dur = 3.5 + Math.random() * 2;
     let st = 0;
@@ -2671,7 +3074,7 @@ function spawnExplosion(origin) {
       new THREE.Color().setHSL(0.06 + Math.random() * 0.08, 1, 0.55 + Math.random() * 0.3), 1));
     m.position.copy(origin);
     const dir = new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.9 + 0.1, Math.random() - 0.5).normalize();
-    scene.add(m);
+    addFx(m);
     debrisParticles.push({ mesh: m, vel: dir.multiplyScalar(8 + Math.random() * 14), life: 0.6 + Math.random() * 1.2 });
   }
 
@@ -2689,7 +3092,7 @@ function spawnExplosion(origin) {
     );
     shard.castShadow = true;
     shard.position.copy(origin).add(new THREE.Vector3((Math.random() - 0.5) * GATE_W, Math.random() * 3, 0));
-    scene.add(shard);
+    addFx(shard);
     const vel = new THREE.Vector3((Math.random() - 0.5) * 14, 4 + Math.random() * 8, 2 + Math.random() * 12);
     const spin = new THREE.Vector3(Math.random() * 10, Math.random() * 10, Math.random() * 10);
     let life = 7;
@@ -2719,7 +3122,7 @@ function spawnExplosion(origin) {
   );
   scorch.rotation.x = -Math.PI / 2;
   scorch.position.set(origin.x, 0.025, origin.z + 0.8);
-  scene.add(scorch);
+  addFx(scorch);
 
   cameraShake = 0.9;
 }
@@ -2745,6 +3148,7 @@ function updateDebris(dt) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function toggleCamouflage() {
+  if (strangle) return;
   if (!hasCamoItem) { showMessage('No tienes equipo de camuflaje.', 2000); return; }
   if (isCamouflaged) { showMessage('Quédate quieto bajo la bolsa; muévete para salir.', 2200); return; }
   if (!isCrouching) { showMessage('Agáchate primero (C) para activar el camuflaje.', 2200); return; }
@@ -2780,9 +3184,11 @@ function updateHUD() {
   const inv = $('inventory');
   if (inv) {
     let html = '';
+    if (hasKnife)   html += '<span class="inv-item" title="Cuchillo improvisado (un solo uso)">🔪</span>';
     if (hasBomb)    html += '<span class="inv-item" title="Bomba">💣</span>';
     if (hasCamoItem) html += '<span class="inv-item" title="Bolsa de camuflaje">🛍️</span>';
     if (hasKey)     html += '<span class="inv-item" title="Llave">🗝️</span>';
+    if (hasStorageKey) html += '<span class="inv-item" title="Llave del depósito">🔑</span>';
     if (bombPlanted) html += '<span class="inv-item blink-red" title="Bomba activa">💣 ACTIVA</span>';
     inv.innerHTML = html;
   }
@@ -2813,7 +3219,14 @@ function updateInteractionPrompt() {
 
   // Prioridad 1: Derribo sigiloso
   for (const g of guards) {
-    if (isStealthKillPossible(g)) { prompt = '[ E ] Neutralizar de un golpe'; break; }
+    if (isStealthKillPossible(g)) { prompt = '[ E ] Eliminar al guardia (el cuchillo se romperá)'; break; }
+  }
+  // Sin cuchillo: ahorcar apretando E
+  if (strangle) prompt = '¡Sigue apretando E!';
+  else if (!prompt && !hasKnife) {
+    for (const g of guards) {
+      if (g.alive && isBehindGuard(g)) { prompt = '[ E ] (repetidamente) Ahorcar al guardia'; break; }
+    }
   }
 
   // Prioridad 2: Ítem cercano
@@ -2824,7 +3237,12 @@ function updateInteractionPrompt() {
     }
   }
 
-  // Prioridad 3: Compuerta
+  // Prioridad 3: Puerta con candado del depósito
+  if (!prompt && isPlayerNearStorageDoor()) {
+    prompt = hasStorageKey ? '[ E ] Abrir candado del depósito' : '🔒 Depósito cerrado — hace falta una llave';
+  }
+
+  // Prioridad 4: Compuerta
   if (!prompt) {
     if (isPlayerNearGate()) {
       if (hasKey && !gateOpen)    prompt = '[ E ] Abrir Compuerta';
@@ -2875,7 +3293,7 @@ function setupVolumeControls() {
     input.addEventListener('change', () => input.blur());
   };
   bind('volume-music', 'prisonEscape.musicVolume', v => music.setLevel(v));
-  bind('volume-sfx', 'prisonEscape.sfxVolume', v => soundEffects.setLevel(v));
+  bind('volume-sfx', 'prisonEscape.sfxVolume', v => { soundEffects.setLevel(v); ambient.setLevel(v); });
 }
 
 function setupInput() {
@@ -2913,7 +3331,7 @@ function setupInput() {
     if (e.code === 'KeyE') handleInteract();
 
     // Reinicio de emergencia
-    if (e.code === 'KeyR' && (gs === GS.GAMEOVER || gs === GS.VICTORY)) location.reload();
+    if (e.code === 'KeyR' && (gs === GS.GAMEOVER || gs === GS.VICTORY)) restartGame();
   });
 
   document.addEventListener('keyup', e => { delete keys[e.code]; });
@@ -2939,26 +3357,149 @@ function setupInput() {
     if (notice) notice.classList.toggle('visible', !mouseLocked && gs === GS.PLAYING);
   });
 
-  $('start-btn')?.addEventListener('click', () => {
-    $('start-overlay').style.display = 'none';
-    gs = GS.PLAYING;
-    music.play('ambient');
-    // Reiniciar reloj para que t=0 al comenzar (evita sweep aleatorio al inicio)
-    clock.stop();
-    clock.start();
-    // 5 segundos de gracia: sin detección de guardias ni reflectores
-    startupGrace = 5;
-    renderer.domElement.requestPointerLock();
-    updateHUD();
-  });
+  $('start-btn')?.addEventListener('click', startGame);
 
   $('music-toggle')?.addEventListener('click', event => {
     music.toggleMute(event.currentTarget);
   });
   setupVolumeControls();
 
-  $('restart-btn')?.addEventListener('click',         () => location.reload());
-  $('restart-victory-btn')?.addEventListener('click', () => location.reload());
+  $('restart-btn')?.addEventListener('click',         restartGame);
+  $('restart-victory-btn')?.addEventListener('click', restartGame);
+}
+
+/** Empieza la partida (con el botón INICIAR FUGA o al reiniciar). */
+function startGame() {
+  $('start-overlay').style.display = 'none';
+  gs = GS.PLAYING;
+  music.play('ambient');
+  // Reiniciar reloj para que t=0 al comenzar (evita sweep aleatorio al inicio)
+  clock.stop();
+  clock.start();
+  // 5 segundos de gracia: sin detección de guardias ni reflectores
+  startupGrace = 5;
+  renderer.domElement.requestPointerLock();
+  updateHUD();
+  showMessage('🔪 Tienes un cuchillo improvisado: sólo aguanta un golpe. Después sólo podrás ahorcar (E repetidamente).', 5500);
+}
+
+/**
+ * Reinicia la partida sin recargar la página: deja todo como al cargar (jugador, guardias,
+ * ítems, compuerta, puerta del depósito, luces y efectos) reutilizando los modelos ya cargados.
+ */
+function restartGame() {
+  // — Timers y efectos de la partida anterior —
+  clearInterval(bombFuseInterval); bombFuseInterval = null;
+  clearInterval(triviaInterval);
+  clearTimeout(gameOverTimeout);
+  timedEffects = [];
+  cameraShake = 0;
+  for (const d of debrisParticles) scene.remove(d.mesh);
+  debrisParticles = [];
+  for (const o of fxObjects) scene.remove(o);
+  fxObjects.length = 0;
+  for (const light of [keyLight, storageKeyLight, explosionLight]) if (light) light.intensity = 0;
+
+  // — Jugador —
+  endStrangle();
+  playerPos.set(3.5, PL.hStand / 2, 36.5);
+  playerVelocity.set(0, 0, 0);
+  isJumping = isInteracting = isDead = isCrouching = isCamouflaged = landSoundPending = false;
+  jumpVelocity = 0;
+  hasCamoItem = hasBomb = hasKey = hasStorageKey = false;
+  hasKnife = true;
+  hasUsedRevive = false;
+  graceTimer = 0;
+  activeTriviaQ = null;
+  bombPlanted = false;
+  bombPlaceProgress = 0;
+  noiseMsgCooldown = 0;
+  Object.keys(keys).forEach(k => delete keys[k]);
+  if (playerMesh) playerMesh.visible = true;
+  if (playerMixer) {
+    playerMixer.stopAllAction();
+    activeAction = null;
+    fadeToAction('idle', 0);
+  }
+  camYaw = 0; camPitch = 0.28; camDist = CAM.dist;
+  camSmooth.set(playerPos.x, CAM.yOff, playerPos.z + CAM.dist);
+
+  // — Ítems: las llaves caídas se quitan; bomba y bolsa vuelven a su lugar —
+  worldItems = worldItems.filter(item => {
+    if (item.type !== 'key' && item.type !== 'storageKey') return true;
+    scene.remove(item.mesh);
+    return false;
+  });
+  for (const item of worldItems) {
+    if (!item.home) continue;
+    item.active = true;
+    item.mesh.position.copy(item.home.position);
+    item.mesh.rotation.copy(item.home.rotation);
+    item.mesh.visible = true;
+    if (!item.mesh.parent) scene.add(item.mesh);
+    if (item.marker && !item.marker.parent) scene.add(item.marker);
+    for (const o of item.extras || []) if (!o.parent) scene.add(o);
+    if (item.markerLight) item.markerLight.intensity = item.lightIntensity;
+    if (item.type === 'bomb') {
+      bombMesh = item.mesh;
+      bombPulseLight = item.light;
+      bombPulseLight.intensity = item.lightIntensity;
+    }
+  }
+
+  // — Guardias —
+  for (const g of guards) {
+    g.alive = true;
+    g.state = 'patrol';
+    g.turnTimer = 0;
+    g.suspicion = 0;
+    g.listening = false;
+    g.strangled = false;
+    g.wpTarget = 1;
+    g.wpDir = 1;
+    g.pos.copy(g.points[0]);
+    g.pos.y = 0;
+    g.facingAngle = Math.atan2(g.points[1].x - g.points[0].x, g.points[1].z - g.points[0].z);
+    g.model.position.copy(g.pos);
+    g.model.rotation.set(0, g.facingAngle, 0);
+    if (!g.coneMesh.parent) scene.add(g.coneMesh);
+    if (g.carries === 'key' && !g.keyIcon) { g.keyIcon = makeKeyIcon(); scene.add(g.keyIcon); }
+    if (g.mixer) g.mixer.stopAllAction();
+    g.activeAction = null;
+    fadeToGuardAction(g, 'caminar', 0);
+  }
+
+  // — Compuerta y puerta del depósito —
+  if (gateModel) {
+    gateModel.position.copy(gateHome.position);
+    gateModel.rotation.copy(gateHome.rotation);
+    gateModel.scale.copy(gateHome.scale);
+    if (!gateModel.parent) scene.add(gateModel);
+    gateMesh = gateModel;
+    for (const list of [staticColliders, visionOccluders]) if (!list.includes(gateColliderBox)) list.push(gateColliderBox);
+    gateCollider = gateColliderBox;
+  }
+  gateOpen = false;
+  if (storageDoor) {
+    storageDoor.parts.forEach((p, i) => {
+      p.position.y = storageDoor.baseY[i];
+      if (!p.parent) scene.add(p);
+    });
+    if (!staticColliders.includes(storageDoor.collider)) staticColliders.push(storageDoor.collider);
+    storageDoor.open = false;
+  }
+
+  // — Pantallas, carteles y sonido —
+  for (const id of ['gameover-screen', 'victory-screen', 'interrogation-modal', 'bomb-place-ui', 'bomb-countdown', 'strangle-ui']) {
+    const el = $(id);
+    if (el) el.style.display = 'none';
+  }
+  const flash = $('alert-flash');
+  if (flash) { flash.style.opacity = '0'; flash.style.background = 'rgba(255,255,255,0.95)'; }
+  $('game-message')?.classList.remove('visible');
+  soundEffects.stopLoop();
+
+  startGame();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2987,7 +3528,7 @@ function animate() {
   }
 
   // ── Movimiento del jugador ─────────────────────────────────────────────────
-  const canMove = (gs === GS.PLAYING || gs === GS.GRACE) && !isInteracting && !isDead;
+  const canMove = (gs === GS.PLAYING || gs === GS.GRACE) && !isInteracting && !isDead && !strangle;
   _mv.set(0, 0, 0);
 
   if (canMove) {
@@ -3087,8 +3628,8 @@ function animate() {
       fadeToAction('idle', 0.3);
     }
   } else if (playerMixer && !canMove && !isActionLocked) {
-    // Bloqueado por alert/interrogación: idle
-    fadeToAction('idle', 0.3);
+    // Bloqueado por alert/interrogación (o ahorcando a un guardia): quieto
+    fadeToAction(strangle ? 'agachado' : 'idle', 0.3);
   }
 
   // ── Cámara third-person (over-the-shoulder) ────────────────────────────────
@@ -3124,8 +3665,10 @@ function animate() {
 
   // ── Sistemas ───────────────────────────────────────────────────────────────
   updateGuards(dt);
+  updateStrangle(dt);
   updateSpotlights(t);
   updateCeilingLights(t);
+  ambient.update(playerPos.x, playerPos.z);
   updateBombPlacing(dt);
   updateDebris(dt);
   updateTimedEffects(dt);

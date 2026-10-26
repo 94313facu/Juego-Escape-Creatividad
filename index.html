@@ -55,11 +55,11 @@
     <div class="ol-routes">
       <div class="route-card">
         <div class="route-icon">💣</div>
-        <div><strong>Ruta A — Demolición</strong><br>Encuentra la bomba, colócala en la compuerta y huye.</div>
+        <div><strong>Ruta A — Demolición</strong><br>El depósito tiene candado: elimina al guardia del comedor, toma su llave, saca la bomba, colócala en la compuerta y huye.</div>
       </div>
       <div class="route-card">
         <div class="route-icon">🗝️</div>
-        <div><strong>Ruta B — Sigilo</strong><br>Abate al guardia por la espalda, toma la llave y escapa.</div>
+        <div><strong>Ruta B — Sigilo</strong><br>Elimina por la espalda al guardia marcado con la llave, abre la compuerta y escapa. Tu cuchillo improvisado se rompe tras un solo uso; después sólo puedes ahorcar a un guardia apretando E repetidamente, y es lento y arriesgado.</div>
       </div>
     </div>
 
@@ -102,6 +102,12 @@
     <div id="bomb-place-ui" style="display:none;">
       <div class="bp-label">⚡ COLOCANDO BOMBA — Mantén [ E ]</div>
       <div id="bomb-progress-track"><div id="bomb-progress-fill"></div></div>
+    </div>
+
+    <!-- ─── AHORCAMIENTO (sin cuchillo): barra que se llena apretando E ─── -->
+    <div id="strangle-ui" style="display:none;">
+      <div class="bp-label">🫳 AHORCANDO — Aprieta [ E ] repetidamente</div>
+      <div id="strangle-progress-track"><div id="strangle-progress-fill"></div></div>
     </div>
 
     <!-- ─── CUENTA ATRÁS DE DETONACIÓN ─── -->
