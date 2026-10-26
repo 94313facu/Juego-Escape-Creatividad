@@ -55,6 +55,8 @@ const CAM = {
   pitchMin: -0.18, // Eje Y mínimo (mirar arriba)
   pitchMax:  1.10, // Eje Y máximo (casi cenital)
   sens:      0.0026,
+  minDist:    0.6,  // Distancia mínima al jugador cuando una pared la empuja
+  wallMargin: 0.35, // Separación entre la cámara y la pared u obstáculo
 };
 
 // IA de guardias
@@ -102,6 +104,7 @@ let jumpVelocity  = 0;
 let landSoundPending = false; // Un salto en curso: suena el golpe al tocar el suelo
 const JUMP_FORCE = 4.8;   // Velocidad inicial del salto (u/s) - Reducida para realismo humano
 const GRAVITY    = 18;    // Gravedad (u/s²)
+const GRAB_ANIM_SPEED = 2.5; // El clip 'agarrar' dura ~3.8 s: acelerado, el jugador no queda trabado
 /** Posición lógica del centro del jugador (y = altura del centro, no del suelo) */
 let playerPos = new THREE.Vector3(0, PL.hStand / 2, COURT.D / 2 - 6);
 /** Velocidad del jugador en el frame actual (para el sistema de camuflaje) */
@@ -111,6 +114,9 @@ let playerVelocity = new THREE.Vector3();
 let camYaw   = 0;     // Yaw 0 = mirando hacia el norte (hacia la puerta)
 let camPitch = 0.28;
 let camSmooth = new THREE.Vector3(0, CAM.yOff, CAM.dist); // Posición suavizada
+let camDist   = CAM.dist; // Distancia real al jugador, acortada si hay una pared detrás
+const _camPivot  = new THREE.Vector3();
+const _camOffset = new THREE.Vector3();
 
 // — Input —
 let keys = {};
@@ -150,6 +156,8 @@ let bombPlaceProgress = 0;  // 0 → 3 s (se llena mientras el jugador mantiene 
 let bombPlanted       = false;
 let bombFuseInterval  = null;
 let bombPulseLight    = null;  // PointLight roja parpadeante de la bomba en el suelo
+let keyLight          = null;  // PointLight dorada de la llave (apagada hasta que aparece)
+let explosionLight    = null;  // PointLight del destello de la explosión (apagada hasta detonar)
 let bombMesh          = null;
 
 // — Compuerta —
@@ -608,6 +616,14 @@ function buildLighting() {
   const gateAccent = new THREE.PointLight(0xff6622, 8, 22);
   gateAccent.position.set(0, 5, -COURT.D / 2 + 5);
   scene.add(gateAccent);
+
+  // ── Brillo de la llave: apagado hasta que un guardia la suelta (ver spawnKey) ──
+  keyLight = new THREE.PointLight(0xffcc00, 0, 6);
+  scene.add(keyLight);
+
+  // ── Destello de la explosión: apagado hasta que detona la bomba (ver spawnExplosion) ──
+  explosionLight = new THREE.PointLight(0xffa040, 0, 60, 1.6);
+  scene.add(explosionLight);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -652,6 +668,32 @@ function hasClearLineOfSight(origin, target) {
     if (hit && hit.distanceTo(origin) < distance - 0.2) return false;
   }
   return true;
+}
+
+/**
+ * Distancia máxima a la que puede ubicarse la cámara desde `pivot` en la dirección
+ * `dir` (normalizada) sin atravesar un obstáculo ni salir del patio.
+ */
+function getCameraAllowedDistance(pivot, dir, maxDist) {
+  let allowed = maxDist;
+
+  // Interior del patio: también cubre las aberturas de los muros (salida sur, compuerta)
+  const hx = COURT.W / 2 - WALL.T / 2 - CAM.wallMargin;
+  const hz = COURT.D / 2 - WALL.T / 2 - CAM.wallMargin;
+  if (Math.abs(pivot.x) < hx && Math.abs(pivot.z) < hz) {
+    if (dir.x !== 0) allowed = Math.min(allowed, ((dir.x > 0 ? hx : -hx) - pivot.x) / dir.x);
+    if (dir.z !== 0) allowed = Math.min(allowed, ((dir.z > 0 ? hz : -hz) - pivot.z) / dir.z);
+  }
+
+  // Obstáculos entre el jugador y la cámara
+  _visionRay.set(pivot, dir);
+  for (const box of staticColliders) {
+    if (box.containsPoint(pivot)) continue; // P. ej. el jugador parado sobre un contenedor
+    const hit = _visionRay.intersectBox(box, _visionHit);
+    if (hit) allowed = Math.min(allowed, hit.distanceTo(pivot) - CAM.wallMargin);
+  }
+
+  return Math.max(allowed, CAM.minDist);
 }
 
 const _pAABB  = new THREE.Box3();
@@ -953,8 +995,9 @@ function loadFBX(path) {
  * @param {string} name     - Clave del diccionario `actions`
  * @param {number} duration - Duración del fundido (seg)
  * @param {boolean} [once]  - Si true, la animación se reproduce una sola vez (salto, morir, agarrar)
+ * @param {number} [timeScale] - Velocidad de reproducción del clip (1 = normal)
  */
-function fadeToAction(name, duration = 0.2, once = false) {
+function fadeToAction(name, duration = 0.2, once = false, timeScale = 1) {
   if (!actions[name]) return;
   const previousAction = activeAction;
   activeAction = actions[name];
@@ -964,7 +1007,7 @@ function fadeToAction(name, duration = 0.2, once = false) {
 
   activeAction
     .reset()
-    .setEffectiveTimeScale(1)
+    .setEffectiveTimeScale(timeScale)
     .setEffectiveWeight(1)
     .fadeIn(duration)
     .play();
@@ -1855,12 +1898,13 @@ function spawnKey(pos) {
   keyMesh.rotation.x = Math.PI / 2;
   scene.add(keyMesh);
 
-  const kl = new THREE.PointLight(0xffcc00, 5, 6);
-  kl.position.copy(keyMesh.position);
-  scene.add(kl);
+  // Se reutiliza la luz creada (apagada) en buildLighting: agregar una luz nueva
+  // a mitad de partida recompila los shaders y congela el juego un instante
+  keyLight.position.copy(keyMesh.position);
+  keyLight.intensity = 5;
 
   worldItems.push({
-    type: 'key', mesh: keyMesh,
+    type: 'key', mesh: keyMesh, markerLight: keyLight,
     pos:  keyMesh.position.clone(),
     active: true,
     label: '[ E ] Recoger Llave Maestra',
@@ -2090,7 +2134,7 @@ function handleInteract() {
     if (isStealthKillPossible(g)) {
       killGuard(g);
       soundEffects.play('guardTakedown');
-      showMessage('🔪 Guardia neutralizado en silencio. ¡Busca la llave!', 2800);
+      showMessage('👊 Guardia noqueado de un golpe. ¡Busca la llave!', 2800);
       return;
     }
   }
@@ -2121,16 +2165,18 @@ function pickupItem(item) {
   soundEffects.play(item.type === 'key' ? 'keyPickup' : 'pickup');
   scene.remove(item.mesh);
   if (item.marker) scene.remove(item.marker);
-  if (item.markerLight) scene.remove(item.markerLight);
+  // Las luces se apagan en vez de quitarse: cambiar la cantidad de luces de la
+  // escena obliga a recompilar los shaders de todos los materiales (congela el juego)
+  if (item.markerLight) item.markerLight.intensity = 0;
   if (item.extras) item.extras.forEach(o => scene.remove(o));
 
   isInteracting = true;
-  fadeToAction('agarrar', 0.2, true);
+  fadeToAction('agarrar', 0.15, true, GRAB_ANIM_SPEED);
 
   switch (item.type) {
     case 'bomb':
       hasBomb = true;
-      if (bombPulseLight) { scene.remove(bombPulseLight); bombPulseLight = null; }
+      if (bombPulseLight) { bombPulseLight.intensity = 0; bombPulseLight = null; }
       showMessage('💣 Bomba recogida. Llévala a la compuerta y mantén [ E ] para colocarla.', 4500);
       break;
     case 'camo':
@@ -2322,16 +2368,13 @@ function spawnExplosion(origin) {
     return true;
   });
 
-  // ── Destello de luz que ilumina muros y patio
-  const flashLight = new THREE.PointLight(0xffa040, 900, 60, 1.6);
-  flashLight.position.copy(origin).setY(3);
-  scene.add(flashLight);
+  // ── Destello de luz que ilumina muros y patio (luz creada apagada en buildLighting)
+  explosionLight.position.copy(origin).setY(3);
   let lt = 0;
   timedEffects.push(dt => {
     lt += dt;
-    flashLight.intensity = 900 * Math.max(0, 1 - lt / 0.9) ** 2;
-    if (lt >= 0.9) { scene.remove(flashLight); return false; }
-    return true;
+    explosionLight.intensity = 900 * Math.max(0, 1 - lt / 0.9) ** 2;
+    return lt < 0.9;
   });
 
   // ── Columna de humo: bolas grises que suben, se agrandan y se disipan
@@ -2505,7 +2548,7 @@ function updateInteractionPrompt() {
 
   // Prioridad 1: Derribo sigiloso
   for (const g of guards) {
-    if (isStealthKillPossible(g)) { prompt = '[ E ] Neutralizar con navaja'; break; }
+    if (isStealthKillPossible(g)) { prompt = '[ E ] Neutralizar de un golpe'; break; }
   }
 
   // Prioridad 2: Ítem cercano
@@ -2798,9 +2841,21 @@ function animate() {
   camSmooth.y = THREE.MathUtils.lerp(camSmooth.y, desiredY, lerpF);
   camSmooth.z = THREE.MathUtils.lerp(camSmooth.z, desiredZ, lerpF);
 
-  camera.position.copy(camSmooth);
   // La cámara mira a la altura base del jugador para no temblar durante el salto
-  camera.lookAt(playerPos.x, baseTgtY + (isCrouching ? 0.5 : 0.95), playerPos.z);
+  _camPivot.set(playerPos.x, baseTgtY + (isCrouching ? 0.5 : 0.95), playerPos.z);
+
+  // Colisión: si hay una pared u obstáculo detrás, la cámara se acerca al jugador.
+  // Se acerca de inmediato (nunca atraviesa la pared) y se aleja de nuevo suavemente.
+  _camOffset.subVectors(camSmooth, _camPivot);
+  const fullDist = _camOffset.length();
+  _camOffset.multiplyScalar(1 / fullDist);
+  const allowedDist = getCameraAllowedDistance(_camPivot, _camOffset, fullDist);
+  camDist = allowedDist < camDist
+    ? allowedDist
+    : THREE.MathUtils.lerp(camDist, allowedDist, 1 - Math.exp(-6 * dt));
+
+  camera.position.copy(_camPivot).addScaledVector(_camOffset, camDist);
+  camera.lookAt(_camPivot);
 
   // ── Sistemas ───────────────────────────────────────────────────────────────
   updateGuards(dt);
