@@ -99,6 +99,7 @@ let isJumping     = false;
 let isInteracting = false;
 let isDead        = false;
 let jumpVelocity  = 0;
+let landSoundPending = false; // Un salto en curso: suena el golpe al tocar el suelo
 const JUMP_FORCE = 4.8;   // Velocidad inicial del salto (u/s) - Reducida para realismo humano
 const GRAVITY    = 18;    // Gravedad (u/s²)
 /** Posición lógica del centro del jugador (y = altura del centro, no del suelo) */
@@ -2014,6 +2015,7 @@ function answerTrivia(chosen) {
     );
     hasUsedRevive = true;
     gs = GS.GRACE;
+    soundEffects.play('triviaCorrect');
     music.play('grace', { loop: false, fadeMs: 400 });
     graceTimer = 5; // 5 segundos para buscar cobertura
     updateHUD();
@@ -2032,6 +2034,8 @@ function triggerGameOver() {
   gs = GS.GAMEOVER;
   music.play('gameover', { loop: false, fadeMs: 500 });
   soundEffects.play('capture');
+  soundEffects.stopLoop();
+  soundEffects.play('death');
   isDead = true;
   fadeToAction('morir', 0.1, true); // Transición rápida a morir
 
@@ -2050,6 +2054,7 @@ function triggerGameOver() {
 function triggerVictory(route) {
   if (gs === GS.VICTORY) return;
   gs = GS.VICTORY;
+  soundEffects.stopLoop();
   music.play(route === 'bomb' ? 'victoryBomb' : 'victoryStealth', { loop: false, fadeMs: 700 });
   const msg = $('victory-message');
   if (msg) {
@@ -2084,6 +2089,7 @@ function handleInteract() {
   for (const g of guards) {
     if (isStealthKillPossible(g)) {
       killGuard(g);
+      soundEffects.play('guardTakedown');
       showMessage('🔪 Guardia neutralizado en silencio. ¡Busca la llave!', 2800);
       return;
     }
@@ -2112,7 +2118,7 @@ function handleInteract() {
 
 function pickupItem(item) {
   item.active = false;
-  soundEffects.play('pickup');
+  soundEffects.play(item.type === 'key' ? 'keyPickup' : 'pickup');
   scene.remove(item.mesh);
   if (item.marker) scene.remove(item.marker);
   if (item.markerLight) scene.remove(item.markerLight);
@@ -2440,6 +2446,7 @@ function toggleCamouflage() {
   }
   isCamouflaged = true;
   hasCamoItem = false;
+  soundEffects.play('camoOn');
   if (camoBagMesh) {
     camoBagMesh.position.set(playerPos.x, getGroundHeight(playerPos) + (camoBagMesh.userData.groundOffset || 0), playerPos.z);
     camoBagMesh.rotation.y = playerMesh?.rotation.y ?? 0;
@@ -2588,6 +2595,7 @@ function setupInput() {
       const isMoving = keys['KeyW'] || keys['KeyA'] || keys['KeyS'] || keys['KeyD'];
       const jumpAnim = isMoving ? 'saltar' : 'saltar_en_el_lugar';
       fadeToAction(jumpAnim, 0.15, true);
+      landSoundPending = true;
     }
 
     // Toggle camuflaje
@@ -2716,6 +2724,10 @@ function animate() {
     if (playerPos.y <= targetCenterY && jumpVelocity < 0) {
       playerPos.y  = targetCenterY;
       jumpVelocity = 0;
+      if (landSoundPending) {
+        landSoundPending = false;
+        soundEffects.play('land');
+      }
       if (isJumping && !actions['saltar'] && !actions['saltar_en_el_lugar']) isJumping = false;
     }
   } else {
@@ -2745,6 +2757,13 @@ function animate() {
   if (playerMixer) playerMixer.update(dt);
 
   const isActionLocked = isJumping || isInteracting || isDead;
+
+  // ── Pasos: en bucle sólo mientras el jugador se desplaza por el suelo ───────
+  if (canMove && !isActionLocked && _mv.lengthSq() > 1e-5) {
+    soundEffects.startLoop(isCrouching ? 'footstepsSneak' : 'footstepsRun');
+  } else {
+    soundEffects.stopLoop();
+  }
 
   if (playerMixer && canMove && !isActionLocked) {
     const isMoving = _mv.lengthSq() > 1e-5;
