@@ -18,7 +18,7 @@ import { FBXLoader  } from 'three/addons/loaders/FBXLoader.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { MusicManager } from './music.js';
-import { SoundEffects, AmbientZones } from './sound-effects.js';
+import { SoundEffects } from './sound-effects.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §1 · CONSTANTES
@@ -351,13 +351,6 @@ const CEILING_LAMPS = [
   [0, 16, 'tube'],                                                                  // Puesto de guardia
 ];
 const FLICKER_LAMP = 3; // Índice de la lámpara del pasillo que parpadea
-
-// Sonido ambiente por zona (ver audio/ambient/README.md): rectángulos del mapa en X/Z
-const ambient = new AmbientZones([
-  { src: './audio/ambient/goteo-duchas.mp3',          x0: -21,    x1: -7,    z0: 8,  z1: 19,   volume: 0.55, fade: 5 },
-  { src: './audio/ambient/murmullo-comedor.mp3',      x0: -34.75, x1: -21,   z0: 8,  z1: 26,   volume: 0.5,  fade: 6 },
-  { src: './audio/ambient/zumbido-fluorescentes.mp3', x0: -34.75, x1: 34.75, z0: 26, z1: 39.75, volume: 0.35, fade: 5 },
-]);
 
 /** Líneas pintadas en el piso: zona restringida frente a la compuerta y cancha. */
 function buildFloorMarkings() {
@@ -2704,7 +2697,6 @@ function triggerGameOver() {
   music.play('gameover', { loop: false, fadeMs: 500 });
   soundEffects.play('capture');
   soundEffects.stopLoop();
-  ambient.stop();
   soundEffects.play('death');
   isDead = true;
   fadeToAction('morir', 0.1, true); // Transición rápida a morir
@@ -2725,7 +2717,6 @@ function triggerVictory(route) {
   if (gs === GS.VICTORY) return;
   gs = GS.VICTORY;
   soundEffects.stopLoop();
-  ambient.stop();
   music.play(route === 'bomb' ? 'victoryBomb' : 'victoryStealth', { loop: false, fadeMs: 700 });
   const msg = $('victory-message');
   if (msg) {
@@ -3293,7 +3284,7 @@ function setupVolumeControls() {
     input.addEventListener('change', () => input.blur());
   };
   bind('volume-music', 'prisonEscape.musicVolume', v => music.setLevel(v));
-  bind('volume-sfx', 'prisonEscape.sfxVolume', v => { soundEffects.setLevel(v); ambient.setLevel(v); });
+  bind('volume-sfx', 'prisonEscape.sfxVolume', v => soundEffects.setLevel(v));
 }
 
 function setupInput() {
@@ -3668,7 +3659,6 @@ function animate() {
   updateStrangle(dt);
   updateSpotlights(t);
   updateCeilingLights(t);
-  ambient.update(playerPos.x, playerPos.z);
   updateBombPlacing(dt);
   updateDebris(dt);
   updateTimedEffects(dt);
