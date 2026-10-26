@@ -105,8 +105,9 @@ let landSoundPending = false; // Un salto en curso: suena el golpe al tocar el s
 const JUMP_FORCE = 4.8;   // Velocidad inicial del salto (u/s) - Reducida para realismo humano
 const GRAVITY    = 18;    // Gravedad (u/s²)
 const GRAB_ANIM_SPEED = 2.5; // El clip 'agarrar' dura ~3.8 s: acelerado, el jugador no queda trabado
-/** Posición lógica del centro del jugador (y = altura del centro, no del suelo) */
-let playerPos = new THREE.Vector3(0, PL.hStand / 2, COURT.D / 2 - 6);
+/** Posición lógica del centro del jugador (y = altura del centro, no del suelo).
+ *  Arranca en su celda del pabellón, la única con los barrotes abiertos. */
+let playerPos = new THREE.Vector3(3.5, PL.hStand / 2, 36.5);
 /** Velocidad del jugador en el frame actual (para el sistema de camuflaje) */
 let playerVelocity = new THREE.Vector3();
 
@@ -286,8 +287,22 @@ function tiledBox(w, h, d, tile) {
 }
 
 // Zonas del patio decoradas con props (ver loadYardProps)
-const COURT_ZONE = { x0: -33.5, x1: -20, z0: 17.5, z1: 32.5 }; // Cancha de básquet (oeste, aro contra la pared)
-const PEN_ZONE   = { x0:  21, x1:  33, z0: 17, z1: 33 }; // Depósito enrejado (este)
+const COURT_ZONE = { x0: -33.5, x1: -20, z0: -10, z1: 3 }; // Cancha de básquet (oeste, aro contra la pared)
+
+// Pabellón: ocupa la mitad sur del penal (z > BLOCK.zN). De sur a norte: fila de
+// celdas, pasillo principal y, del otro lado, comedor (oeste), duchas, celdas,
+// hall de salida, lavandería y depósito (este). Muros interiores sin techo.
+const BLOCK = {
+  zN:      8,     // Fachada norte del pabellón (da al patio)
+  zCells:  33,    // Barrotes de la fila de celdas del sur
+  zHall:   26,    // Borde norte del pasillo principal
+  zRooms:  19,    // Fondo de las celdas del norte / frente de duchas y lavandería
+  H:       4.5,   // Altura de los muros interiores
+  T:       0.5,   // Espesor de los muros interiores
+  doorW:   4,     // Ancho de la puerta del pabellón al patio
+  cellW:   7,     // Ancho de cada celda
+  playerCellDoor: [2, 5], // Hueco en los barrotes de la celda del jugador (X)
+};
 
 /** Líneas pintadas en el piso: zona restringida frente a la compuerta y cancha. */
 function buildFloorMarkings() {
@@ -561,25 +576,97 @@ function buildEnvironment() {
   addWall(-hw, WALL.H / 2, 0,   WALL.T, WALL.H, COURT.D);               // Oeste
   addWall( hw, WALL.H / 2, 0,   WALL.T, WALL.H, COURT.D);               // Este
 
-  // Sur: dos mitades con abertura para el punto de salida del jugador
-  const halfSide = (COURT.W - GATE_W) / 2;
-  const sideOff  = GATE_W / 2 + halfSide / 2;
-  addWall(-sideOff, WALL.H / 2, hd, halfSide, WALL.H, WALL.T);
-  addWall( sideOff, WALL.H / 2, hd, halfSide, WALL.H, WALL.T);
+  // Sur: muro entero (detrás de la fila de celdas del pabellón)
+  addWall(0, WALL.H / 2, hd, COURT.W, WALL.H, WALL.T);
 
+  buildCellBlock(addWall);
   buildRazorWire();
   buildOutsideScenery();
+}
 
-  // Marco de inicio (sur) — visual únicamente
-  const gateMat = new THREE.MeshStandardMaterial({ color: 0x444455, roughness: 0.7 });
-  [-1, 1].forEach(s => {
-    const post = new THREE.Mesh(tiledBox(0.8, WALL.H + 0.5, WALL.T + 1, WALL.H), wallMat);
-    post.position.set(s * GATE_W / 2, WALL.H / 2, hd);
-    scene.add(post);
-  });
-  const lintel = new THREE.Mesh(new THREE.BoxGeometry(GATE_W + 1.6, 1.5, WALL.T + 0.5), gateMat);
-  lintel.position.set(0, WALL.H - 0.75, hd);
-  scene.add(lintel);
+/**
+ * Pabellón de celdas: muros interiores, barrotes y piso propio.
+ * Ver BLOCK para la distribución de las zonas.
+ * @param {Function} addWall - addWall(x, y, z, w, h, d) de buildEnvironment
+ */
+function buildCellBlock(addWall) {
+  const B = BLOCK;
+  const xIn = COURT.W / 2 - WALL.T / 2;   // Cara interior de los muros este/oeste
+  const zIn = COURT.D / 2 - WALL.T / 2;   // Cara interior del muro sur
+
+  // Tramo de muro interior recto (horizontal en X o vertical en Z)
+  const wallX = (x1, x2, z) => addWall((x1 + x2) / 2, B.H / 2, z, x2 - x1, B.H, B.T);
+  const wallZ = (x, z1, z2) => addWall(x, B.H / 2, (z1 + z2) / 2, B.T, B.H, z2 - z1);
+
+  // Piso del pabellón: concreto alisado, distinto de las losas del patio
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(2 * xIn, zIn - B.zN),
+    new THREE.MeshStandardMaterial({ color: 0x5c6066, roughness: 0.85 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(0, 0.012, (zIn + B.zN) / 2);
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // Fachada norte con la única puerta hacia el patio
+  wallX(-xIn, -B.doorW / 2, B.zN);
+  wallX(B.doorW / 2, xIn, B.zN);
+
+  // Comedor (oeste) y depósito (este): se entra desde el pasillo principal
+  const wingX = 21, wingDoor = [25, 30];
+  wallX(-xIn, -wingDoor[1], B.zHall);
+  wallX(-wingDoor[0], -wingX, B.zHall);
+  wallX(wingX, wingDoor[0], B.zHall);
+  wallX(wingDoor[1], xIn, B.zHall);
+  wallZ(-wingX, B.zN, B.zHall);
+  wallZ( wingX, B.zN, B.zHall);
+
+  // Hall de salida (centro): puertas laterales a duchas (oeste) y lavandería (este)
+  const hallX = 7, sideDoor = [12, 15];
+  for (const s of [-1, 1]) {
+    wallZ(s * hallX, B.zN, sideDoor[0]);
+    wallZ(s * hallX, sideDoor[1], B.zHall);
+    wallX(Math.min(s * hallX, s * wingX), Math.max(s * hallX, s * wingX), B.zRooms); // Fondo de las celdas del norte
+    wallZ(s * 14, B.zRooms, B.zHall);                                            // División entre esas dos celdas
+  }
+
+  // Fila de celdas del sur: divisiones cada 7 unidades hasta el muro perimetral
+  for (let x = -28; x <= 28; x += B.cellW) wallZ(x, B.zCells, zIn);
+
+  // Barrotes: la celda del jugador queda abierta; las demás, cerradas
+  const [d0, d1] = B.playerCellDoor;
+  addBars(-xIn, d0, B.zCells);
+  addBars(d1, xIn, B.zCells);
+  addBars(-wingX, -hallX, B.zHall);
+  addBars(hallX, wingX, B.zHall);
+}
+
+/**
+ * Reja de barrotes verticales a lo largo de X. Frena al jugador pero no tapa
+ * la vista: no se agrega a visionOccluders (los guardias ven dentro de las celdas).
+ */
+function addBars(x1, x2, z) {
+  const H = BLOCK.H, GAP = 0.32;
+  const n = Math.max(1, Math.round((x2 - x1) / GAP));
+  if (!addBars.mat) addBars.mat = new THREE.MeshStandardMaterial({ color: 0x3b3f45, metalness: 0.7, roughness: 0.45 });
+  const bars = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.035, 0.035, H, 6), addBars.mat, n);
+  const m = new THREE.Matrix4();
+  for (let i = 0; i < n; i++) {
+    bars.setMatrixAt(i, m.makeTranslation(x1 + (i + 0.5) * (x2 - x1) / n, H / 2, z));
+  }
+  bars.castShadow = true;
+  scene.add(bars);
+
+  // Travesaños arriba, al medio y abajo
+  for (const y of [0.15, H * 0.5, H - 0.1]) {
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(x2 - x1, 0.08, 0.1), addBars.mat);
+    rail.position.set((x1 + x2) / 2, y, z);
+    scene.add(rail);
+  }
+
+  staticColliders.push(new THREE.Box3(
+    new THREE.Vector3(x1, 0, z - 0.1), new THREE.Vector3(x2, H, z + 0.1)
+  ).expandByScalar(0.05));
 }
 
 function buildLighting() {
@@ -607,9 +694,9 @@ function buildLighting() {
   fill.position.set(-20, 30, -30);
   scene.add(fill);
 
-  // ── Luz de acento sobre la zona de inicio del jugador (sur) ──────────────────
+  // ── Luz de acento sobre el pasillo de celdas (sur), donde arranca el jugador ──
   const startAccent = new THREE.PointLight(0xffe0aa, 4, 22);
-  startAccent.position.set(0, 6, COURT.D / 2 - 5);
+  startAccent.position.set(0, 6, BLOCK.zCells - 2);
   scene.add(startAccent);
 
   // ── Luz de acento roja/naranja en la compuerta norte (objetivo) ───────────────
@@ -677,7 +764,7 @@ function hasClearLineOfSight(origin, target) {
 function getCameraAllowedDistance(pivot, dir, maxDist) {
   let allowed = maxDist;
 
-  // Interior del patio: también cubre las aberturas de los muros (salida sur, compuerta)
+  // Interior del penal: también cubre la abertura de la compuerta norte
   const hx = COURT.W / 2 - WALL.T / 2 - CAM.wallMargin;
   const hz = COURT.D / 2 - WALL.T / 2 - CAM.wallMargin;
   if (Math.abs(pivot.x) < hx && Math.abs(pivot.z) < hz) {
@@ -853,24 +940,26 @@ async function loadAllModels() {
   gltf = await loadGLTF('./models/bolsa.glb');
   setupCamoPickup(gltf);
 
-  // ── Obstáculos del patio ───────────────────────────────────────────────────────
-  // Distribución pensada como patio real: comedor (mesas) al sur, gimnasio al
-  // este, contenedores de basura contra las paredes y barreras de concreto en
-  // zigzag antes de la zona restringida. Hay un pasillo central caminable desde
-  // el inicio hasta la compuerta (checkGatePath lo verifica) y ningún obstáculo
-  // pisa las rutas de los guardias (checkPatrolRoutes).
+  // ── Obstáculos del pabellón y del patio ───────────────────────────────────────
+  // Comedor con mesas (pabellón, oeste), gimnasio y cancha en el patio, y
+  // barreras de concreto en zigzag antes de la zona restringida. Debe quedar un
+  // camino caminable de la celda inicial a la compuerta, la bomba y la bolsa
+  // (checkWalkablePaths) y ningún obstáculo debe pisar las rutas de los guardias
+  // (checkPatrolRoutes).
   await setProgress(73, 'Cargando barreras...');
   const barrier = (await loadGLTF('./models/barrera.glb')).scene;
   const barrierSpots = [
     [ -6, -17, 0], [  6, -21, 0], [-3.5, -26, 0], [  8, -28, 0], // Zigzag de cobertura
-    [  0,   6, 0], [ -9,  -4, Math.PI / 2], [  9, -6, Math.PI / 2],  // Centro del patio
+    [  0,   3, 0], [ -9,  -4, Math.PI / 2], [  9, -6, Math.PI / 2],  // Patio, frente a la puerta del pabellón
+    [-14, 13.5, Math.PI / 2],                                       // Duchas
   ];
   for (const [x, z, rotY] of barrierSpots) placeProp(barrier, { x, z, rotY, size: 3 });
 
-  // Comedor: mesas de picnic (largo del modelo en Z)
+  // Comedor del pabellón: dos columnas de mesas de picnic (largo del modelo en Z)
+  // con el pasillo del guardia en el medio (x = -27.5)
   await setProgress(82, 'Cargando mesas...');
   const table = (await loadGLTF('./models/props/mesa_picnic.glb')).scene;
-  const tableSpots = [[-6, 24, 0], [6, 24, 0], [-10, 12, 0], [10, 14.5, 0], [-6, 30, 0], [6, 30, 0]];
+  const tableSpots = [[-31.2, 12, 0], [-31.2, 17, 0], [-31.2, 22, 0], [-23.6, 12, 0], [-23.6, 17, 0], [-23.6, 22, 0]];
   for (const [x, z, rotY] of tableSpots) placeProp(table, { x, z, rotY, size: 2.8 });
 
   // Gimnasio al aire libre: barras de dominadas
@@ -884,15 +973,15 @@ async function loadAllModels() {
   await setProgress(91, 'Cargando contenedores de basura...');
   const dumpster = (await loadGLTF('./models/props/contenedor_basura.glb')).scene;
   const dumpsterSpots = [
-    [-COURT.W / 2 + WALL.T + 1.1, -14, Math.PI / 2],
+    [-COURT.W / 2 + WALL.T + 1.1, -22, Math.PI / 2],
     [ COURT.W / 2 - WALL.T - 1.1, -12, -Math.PI / 2],
-    [ 12, COURT.D / 2 - WALL.T - 1.1, Math.PI],
+    [ 14, BLOCK.zRooms - 1.6, Math.PI],               // Lavandería, contra el fondo
   ];
   for (const [x, z, rotY] of dumpsterSpots) placeProp(dumpster, { x, z, rotY, size: 4 });
 
   await loadYardProps();
   checkPatrolRoutes();
-  checkGatePath();
+  checkWalkablePaths();
 
   await setProgress(100, '¡Listo para la fuga!');
 }
@@ -912,33 +1001,9 @@ function placeProp(source, { x, z, rotY = 0, size, byHeight = false, collide = t
   return m;
 }
 
-/** Tramos de reja de alambre consecutivos a lo largo de un segmento recto. */
-function placeFenceLine(fence, segLen, alongX, x1, z1, x2, z2) {
-  const len = Math.hypot(x2 - x1, z2 - z1);
-  const n = Math.max(1, Math.round(len / segLen));
-  // Si el tramo del modelo es largo en Z, girarlo 90° extra para alinearlo
-  const rotY = -Math.atan2(z2 - z1, x2 - x1) + (alongX ? 0 : Math.PI / 2);
-  for (let i = 0; i < n; i++) {
-    const t = (i + 0.5) / n;
-    const seg = placeProp(fence, { x: x1 + (x2 - x1) * t, z: z1 + (z2 - z1) * t, rotY, size: 3.2, byHeight: true, collide: false });
-    seg.scale[alongX ? 'x' : 'z'] *= (len / n) / segLen; // Ajuste fino para cerrar el tramo exacto
-    addStaticCollider(seg);
-  }
-}
-
-// Props del patio (todos de Sketchfab, CC-BY-4.0 — ver CREDITS.md)
+// Props del patio y del depósito (todos de Sketchfab, CC-BY-4.0 — ver CREDITS.md)
 async function loadYardProps() {
-  // ── Rejas: cercan el depósito (este) ──────────────────────────────────────────
-  await setProgress(94, 'Cargando rejas...');
-  const fence = (await loadGLTF('./models/props/reja.glb')).scene;
-  // Largo de un tramo una vez escalado a la altura de la reja
-  const probe = normalizeModel(fence.clone(true), 3.2, 0, true);
-  const probeSize = new THREE.Box3().setFromObject(probe).getSize(new THREE.Vector3());
-  const alongX = probeSize.x >= probeSize.z;
-  const segLen = Math.max(probeSize.x, probeSize.z);
-  const c = COURT_ZONE, p = PEN_ZONE;
-  placeFenceLine(fence, segLen, alongX, p.x0, p.z0, p.x1, p.z0);       // Depósito: lado norte
-  placeFenceLine(fence, segLen, alongX, p.x0, p.z0 + 6, p.x0, p.z1);   // Depósito: lado oeste (entrada al norte)
+  const c = COURT_ZONE;
 
   // ── Aro de básquet contra la pared oeste, mirando a la cancha ────────────────
   await setProgress(96, 'Cargando cancha...');
@@ -949,22 +1014,22 @@ async function loadYardProps() {
   // ── Tribunas y banco alrededor de la cancha (frente de los modelos = +Z)
   const bleacher = (await loadGLTF('./models/props/tribuna.glb')).scene;
   for (const x of [-30.5, -23.5]) {
-    placeProp(bleacher, { x, z: 13.4, rotY: 0, size: 5.5 });                    // Lado norte
+    placeProp(bleacher, { x, z: c.z0 - 4, rotY: 0, size: 5.5 });                  // Lado norte
   }
   for (const x of [-29.5, -23.8]) {
-    placeProp(bleacher, { x, z: COURT.D / 2 - WALL.T / 2 - 1.5, rotY: Math.PI, size: 5.5 }); // Contra la pared sur
+    placeProp(bleacher, { x, z: BLOCK.zN - 2.2, rotY: Math.PI, size: 5.5 });     // Contra la fachada del pabellón
   }
   const bench = (await loadGLTF('./models/props/banco.glb')).scene;
-  placeProp(bench, { x: -19, z: COURT.D / 2 - WALL.T / 2 - 1.1, rotY: Math.PI, size: 3.5 });
+  placeProp(bench, { x: -18, z: BLOCK.zN - 1.6, rotY: Math.PI, size: 3.5 });
 
 
-  // ── Barriles y cajones: grupos en el depósito y junto a las paredes ──────────
+  // ── Barriles y cajones: en el depósito del pabellón y junto a los muros ──────
   await setProgress(97, 'Cargando barriles...');
   const crates = (await loadGLTF('./models/props/barriles_cajas.glb')).scene;
   const crateSpots = [
-    // Depósito: se deja libre el paso desde la entrada hasta la bomba (30.1, 30.3)
-    [p.x1 - 3, p.z0 + 4, 0], [p.x0 + 5, p.z1 - 3, Math.PI],
-    [-30, -2, Math.PI / 2], [30, 2, -Math.PI / 2], [-29, -27, 0.4], [29, -27, -0.4],
+    // Depósito: se deja libre el paso desde la puerta (x 25–30) hasta la bomba
+    [24, 20.5, 0], [32, 18, Math.PI / 2],
+    [30, 2, -Math.PI / 2], [-29, -31, 0.4], [29, -27, -0.4],
   ];
   for (const [x, z, rotY] of crateSpots) placeProp(crates, { x, z, rotY, size: 6 });
 }
@@ -1399,20 +1464,20 @@ function getLightPoolTexture() {
   return lightPoolTexture;
 }
 
-// Rutas de patrullaje (ida y vuelta). Cada carril pasa libre entre barreras,
-// cajas y contenedores; checkPatrolRoutes() avisa si un obstáculo nuevo lo pisa.
+// Rutas de patrullaje (ida y vuelta). Cada carril pasa libre entre muros, mesas
+// y barreras; checkPatrolRoutes() avisa si un obstáculo nuevo lo pisa.
 const PATROL_ROUTES = [
-  { a: [-16.3, -22], b: [-16.3, 22] }, // Oeste: entre las cajas y la cancha
-  { a: [ 16.3,  22], b: [ 16.3,-22] }, // Este
-  { a: [-26,  -13], b: [-10,  -13] },  // Noroeste: al sur del contenedor
-  { a: [ 25,    8], b: [  8,    8] },  // Centro-este
+  { a: [-31, 29.5], b: [31, 29.5] },   // Pasillo principal del pabellón (el de la llave)
+  { a: [  4,   24], b: [ 4, 10.5] },   // Hall de salida, frente a la puerta al patio
+  { a: [-27.5, 10.5], b: [-27.5, 23.5] }, // Comedor, entre las mesas
+  { a: [-14,  -12], b: [14,  -12] },   // Patio, antes de la zona restringida
 ];
 
 /**
- * Verifica (BFS en grilla de 0,5u) que exista un camino caminable, sin trepar
- * nada, desde la posición inicial del jugador hasta la compuerta norte.
+ * Verifica (BFS en grilla de 0,5u) que desde la celda inicial se pueda llegar
+ * caminando, sin trepar nada, a la compuerta norte, la bomba y la bolsa.
  */
-function checkGatePath() {
+function checkWalkablePaths() {
   const STEP = 0.5, R = PL.radius + 0.06;
   const hw = COURT.W / 2 - WALL.T - PL.radius, hd = COURT.D / 2 - WALL.T - PL.radius;
   const nx = Math.floor((2 * hw) / STEP) + 1, nz = Math.floor((2 * hd) / STEP) + 1;
@@ -1421,25 +1486,44 @@ function checkGatePath() {
     x > box.min.x - R && x < box.max.x + R && z > box.min.z - R && z < box.max.z + R);
   const cell = (x, z) => [Math.round((x + hw) / STEP), Math.round((z + hd) / STEP)];
   const [sx, sz] = cell(playerPos.x, playerPos.z);
+  const reached = new Uint8Array(nx * nz);
   const seen = new Uint8Array(nx * nz);
   const queue = [[sx, sz]];
-  seen[sz * nx + sx] = 1;
+  seen[sz * nx + sx] = reached[sz * nx + sx] = 1;
   while (queue.length) {
     const [ix, iz] = queue.shift();
-    const x = -hw + ix * STEP, z = -hd + iz * STEP;
-    if (iz === 0 && Math.abs(x) < GATE_W / 2 - PL.radius) {
-      console.log('[PrisonEscape] Camino libre del inicio a la compuerta: OK');
-      return true;
-    }
     for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
       const jx = ix + dx, jz = iz + dz;
       if (jx < 0 || jz < 0 || jx >= nx || jz >= nz || seen[jz * nx + jx]) continue;
       seen[jz * nx + jx] = 1;
-      if (free(-hw + jx * STEP, -hd + jz * STEP)) queue.push([jx, jz]);
+      if (free(-hw + jx * STEP, -hd + jz * STEP)) {
+        reached[jz * nx + jx] = 1;
+        queue.push([jx, jz]);
+      }
     }
   }
-  console.warn('[PrisonEscape] No hay camino caminable del inicio a la compuerta');
-  return false;
+
+  // ¿Alguna celda alcanzada cumple la condición?
+  const anyReached = test => {
+    for (let iz = 0; iz < nz; iz++) for (let ix = 0; ix < nx; ix++) {
+      if (reached[iz * nx + ix] && test(-hw + ix * STEP, -hd + iz * STEP, iz)) return true;
+    }
+    return false;
+  };
+  const nearItem = type => {
+    const item = worldItems.find(i => i.type === type);
+    return !item || anyReached((x, z) => Math.hypot(x - item.pos.x, z - item.pos.z) < 2);
+  };
+  const results = {
+    compuerta: anyReached((x, z, iz) => iz === 0 && Math.abs(x) < GATE_W / 2 - PL.radius),
+    bomba: nearItem('bomb'),
+    bolsa: nearItem('camo'),
+  };
+  for (const [name, ok] of Object.entries(results)) {
+    if (ok) console.log(`[PrisonEscape] Camino libre de la celda a ${name}: OK`);
+    else console.warn(`[PrisonEscape] No hay camino caminable de la celda a ${name}`);
+  }
+  return Object.values(results).every(Boolean);
 }
 
 /** Avisa por consola si algún carril de patrulla atraviesa un collider. */
@@ -1545,8 +1629,8 @@ function setupTower(gltf, side) {
   scene.add(spot);
 
   const target = new THREE.Object3D();
-  // Apunta inicialmente al centro-sur del patio (tz + 28 = zona media)
-  target.position.set(tx, 0, tz + 28);
+  // Apunta inicialmente al centro del patio (tz + 19 = zona media del barrido)
+  target.position.set(tx, 0, tz + 19);
   scene.add(target);
   spot.target = target;
 
@@ -1657,8 +1741,8 @@ function setupGate(gltf) {
 }
 
 function setupBombPickup(gltf) {
-  // Al fondo del depósito enrejado (este), entre los barriles y cajones
-  const pos   = new THREE.Vector3(30.1, 0, 30.3);
+  // Al fondo del depósito del pabellón (este), detrás de los barriles y cajones
+  const pos   = new THREE.Vector3(31, 0, 11.5);
   const model = normalizeModel(gltf.scene, 0.7, 0);
   bombMesh = model;
   // Sólo X/Z: normalizeModel ya asentó el modelo sobre el piso
@@ -1698,8 +1782,8 @@ function setupBombPickup(gltf) {
 }
 
 function setupCamoPickup(gltf) {
-  // En la cancha de básquet, frente al aro
-  const pos   = new THREE.Vector3(-24, 0, (COURT_ZONE.z0 + COURT_ZONE.z1) / 2);
+  // En la lavandería del pabellón (se entra desde el hall)
+  const pos   = new THREE.Vector3(16, 0, 11.5);
   // "Trash Bag" de Hellbrush (Sketchfab, CC-BY-4.0). Tamaño suficiente para
   // tapar al jugador agachado cuando se esconde debajo.
   const model = normalizeModel(gltf.scene, 1.4, 0);
@@ -1929,9 +2013,9 @@ function updateSpotlights(t) {
       rig.spot.intensity = 800;
     } else {
       // — Barrido senoidal orgánico (suma de dos frecuencias) —
-      // Centro del barrido desplazado hacia el medio del patio
+      // Sólo recorre el patio (z ≈ -30 a 0): el pabellón queda fuera del barrido
       const sx = Math.sin(t * 0.38 + rig.phase) * 20 - rig.tx * 0.6;
-      const sz = Math.sin(t * 0.22 + rig.phase + 1.4) * 22 + 30;
+      const sz = Math.sin(t * 0.22 + rig.phase + 1.4) * 15 + 19;
       rig.target.position.set(rig.tx + sx, 0, rig.tz + sz);
       rig.spot.color.set(0xffee88);
       rig.spot.intensity = 650;
@@ -2931,10 +3015,11 @@ async function init() {
   buildLighting();
   setupInput();
 
-  // Posición inicial de la cámara
-  camSmooth.set(0, CAM.yOff, CAM.dist);
+  // Posición inicial de la cámara: detrás del jugador (la colisión la acerca
+  // dentro de la celda en el primer cuadro)
+  camSmooth.set(playerPos.x, CAM.yOff, playerPos.z + CAM.dist);
   camera.position.copy(camSmooth);
-  camera.lookAt(0, PL.hStand / 2, 0);
+  camera.lookAt(playerPos.x, PL.hStand / 2, playerPos.z);
 
   try {
     await loadAllModels();
