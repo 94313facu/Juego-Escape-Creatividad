@@ -78,6 +78,16 @@ const GD = {
   hearStrangle: 7,          // Radio en que los otros guardias oyen el forcejeo
 };
 
+// Rendimiento: resolución adaptativa y sombras a media frecuencia
+const PERF = {
+  maxPixelRatio: 1.5,   // Tope de resolución (antes 2): en pantallas HiDPI el costo crecía con el cuadrado
+  minPixelRatio: 0.6,   // Piso de la resolución adaptativa
+  windowSec:     1.5,   // Ventana de medición de cuadros
+  slowMs:        22,    // Por encima (menos de ~45 FPS) se baja la resolución
+  step:          0.15,  // Cuánto cambia la resolución en cada ajuste
+  shadowEvery:   2,     // Las sombras se redibujan cada N cuadros (se ven igual a 30 Hz)
+};
+
 // Preguntas de interrogatorio
 const TRIVIA = [
   { q: '¿Cuál es la capital de Australia?',              a: ['Sídney',     'Canberra',  'Melbourne'], ok: 1 },
@@ -202,8 +212,36 @@ let cameraShake     = 0;  // Segundos de sacudida de cámara restantes
 // — Timers internos —
 let msgTimeout = null;
 
+// — Rendimiento (ver PERF) —
+let perfRatio   = 1;     // Resolución actual del render
+let perfAcc = 0, perfFrames = 0, perfCooldown = 3, perfFps = 0;
+let shadowFrame = 0;
+let dbgTimer = 0;
+
 // Helper DOM
 const $ = id => document.getElementById(id);
+
+/**
+ * Resolución adaptativa: si el promedio de cuadros es lento, baja la resolución del render de a
+ * pasos hasta que la fluidez se recupera. Sólo baja (nunca vuelve a subir), para no oscilar ni
+ * producir tirones al reasignar el buffer. En una máquina potente no cambia nada.
+ */
+function adaptResolution(rawDt) {
+  if (gs === GS.LOADING || document.hidden || rawDt > 0.25) return; // Pestaña oculta o pausa larga: no cuenta
+  perfAcc += rawDt; perfFrames++;
+  if (perfAcc < PERF.windowSec) return;
+  const avgMs = perfAcc / perfFrames * 1000;
+  perfFps = perfFrames / perfAcc;
+  perfAcc = 0; perfFrames = 0;
+  perfCooldown = Math.max(0, perfCooldown - PERF.windowSec);
+  if (perfCooldown > 0) return;
+
+  if (avgMs > PERF.slowMs && perfRatio > PERF.minPixelRatio) {
+    perfRatio = Math.max(PERF.minPixelRatio, perfRatio - PERF.step);
+    renderer.setPixelRatio(perfRatio);
+    perfCooldown = 3; // Dejar que se estabilice antes de volver a medir
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §3 · RENDERER, SCENE, CAMERA
@@ -257,11 +295,17 @@ function buildSky() {
 }
 
 function setupThree() {
-  renderer = new THREE.WebGLRenderer({ canvas: $('game-canvas'), antialias: true });
+  const dpr = window.devicePixelRatio || 1;
+  // En pantallas HiDPI el suavizado de bordes (MSAA) sobra y cuesta mucho: se desactiva desde 1,5
+  renderer = new THREE.WebGLRenderer({ canvas: $('game-canvas'), antialias: dpr < 1.5, powerPreference: 'high-performance' });
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  perfRatio = Math.min(dpr, PERF.maxPixelRatio);
+  renderer.setPixelRatio(perfRatio);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type    = THREE.PCFShadowMap;
+  // Las sombras se redibujan a mano cada PERF.shadowEvery cuadros (ver animate)
+  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.needsUpdate = true;
   renderer.toneMapping       = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 0.9;
 
@@ -292,7 +336,7 @@ function getConcreteTexture() {
     concreteTexture = new THREE.TextureLoader().load('./models/textures/concrete_wall.jpg');
     concreteTexture.colorSpace = THREE.SRGBColorSpace;
     concreteTexture.wrapS = concreteTexture.wrapT = THREE.RepeatWrapping;
-    concreteTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    concreteTexture.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
   }
   return concreteTexture;
 }
@@ -577,7 +621,7 @@ function buildEnvironment() {
     if (srgb) t.colorSpace = THREE.SRGBColorSpace;
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.repeat.set(COURT.W / SLAB, COURT.D / SLAB);
-    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
     return t;
   };
   // Normal + roughness del mismo escaneo: grietas y relieve reaccionan a las luces
@@ -655,7 +699,7 @@ function buildCellBlock(addWall) {
     if (srgb) t.colorSpace = THREE.SRGBColorSpace;
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.repeat.set(floorW / TILE, floorD / TILE);
-    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
     return t;
   };
   const floor = new THREE.Mesh(
@@ -977,6 +1021,8 @@ function getCameraAllowedDistance(pivot, dir, maxDist) {
 const _pAABB  = new THREE.Box3();
 const _oCenter = new THREE.Vector3();
 const _push   = new THREE.Vector3();
+const _pCenter = new THREE.Vector3();
+const _pSize   = new THREE.Vector3();
 
 function getGroundHeight(pos) {
   let highest = 0;
@@ -1013,10 +1059,9 @@ function resolveCollisions(pos) {
   const colY = isJumping ? pos.y + ph / 4 : pos.y;
   const colH = isJumping ? ph / 2 : ph;
 
-  _pAABB.setFromCenterAndSize(
-    new THREE.Vector3(pos.x, colY, pos.z),
-    new THREE.Vector3(PL.radius * 2, colH, PL.radius * 2)
-  );
+  _pCenter.set(pos.x, colY, pos.z);
+  _pSize.set(PL.radius * 2, colH, PL.radius * 2);
+  _pAABB.setFromCenterAndSize(_pCenter, _pSize);
 
   // Dos pasadas: al empujar fuera de una caja se puede entrar en otra (esquinas, rejas junto a muros)
   for (let pass = 0; pass < 2; pass++) {
@@ -1037,10 +1082,8 @@ function resolveCollisions(pos) {
         pos.z += inFromMinZ < inFromMaxZ ? -(inFromMinZ + 0.02) : inFromMaxZ + 0.02;
       }
       // Recalcular AABB para siguiente iteración
-      _pAABB.setFromCenterAndSize(
-        new THREE.Vector3(pos.x, colY, pos.z),
-        new THREE.Vector3(PL.radius * 2, colH, PL.radius * 2)
-      );
+      _pCenter.set(pos.x, colY, pos.z);
+      _pAABB.setFromCenterAndSize(_pCenter, _pSize);
     }
   }
 }
@@ -2174,6 +2217,7 @@ function setupCamoPickup(gltf) {
 const _gFwd   = new THREE.Vector3();
 const _gToPlr = new THREE.Vector3();
 const _gEye   = new THREE.Vector3();
+const _gDir   = new THREE.Vector3(); // Temporal de updateGuards (evita crear un vector por guardia y cuadro)
 let noiseMsgCooldown = 0; // Segundos hasta poder avisar de nuevo que te oyeron
 
 /** Radio en el que un guardia oye al jugador: correr hace ruido, agachado casi nada, quieto nada. */
@@ -2238,7 +2282,7 @@ function updateGuards(dt) {
         g.state = 'alert';
         fadeToGuardAction(g, 'apuntar', 0.2);
       }
-      const dir = new THREE.Vector3().subVectors(playerPos, g.pos);
+      const dir = _gDir.subVectors(playerPos, g.pos);
       g.facingAngle = Math.atan2(dir.x, dir.z);
       g.model.rotation.y = g.facingAngle; // Orientación normal FBX
       return; // Fin de lógica de patrullaje
@@ -2292,7 +2336,7 @@ function updateGuards(dt) {
       // Máquina de estados: Patrullando
       if (g.listening) { g.listening = false; fadeToGuardAction(g, 'caminar', 0.3); }
       const tgt = g.points[g.wpTarget];
-      const dir = new THREE.Vector3().subVectors(tgt, g.pos);
+      const dir = _gDir.subVectors(tgt, g.pos);
       dir.y = 0;
       const distTgt = dir.length();
       dir.normalize();
@@ -3242,6 +3286,8 @@ function updateInteractionPrompt() {
     }
   }
 
+  if (prompt === updateInteractionPrompt.last) return; // Sin cambios: no se toca el DOM
+  updateInteractionPrompt.last = prompt;
   const el = $('interaction-prompt');
   if (el) {
     el.textContent = prompt;
@@ -3503,8 +3549,13 @@ const _mv  = new THREE.Vector3();
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.05); // Cap a 50ms para evitar saltos
+  const rawDt = clock.getDelta();
+  const dt = Math.min(rawDt, 0.05); // Cap a 50ms para evitar saltos
   const t  = clock.getElapsedTime();
+
+  adaptResolution(rawDt);
+  // Sombras a media frecuencia: la geometría de sombras cuesta tanto como dibujar la escena otra vez
+  if (++shadowFrame >= PERF.shadowEvery) { shadowFrame = 0; renderer.shadowMap.needsUpdate = true; }
 
   // Durante la carga, sólo renderizar
   if (gs === GS.LOADING) {
@@ -3698,11 +3749,14 @@ function animate() {
   }
 
   // ── Debug info ─────────────────────────────────────────────────────────────
-  const dbg = $('debug-info');
+  dbgTimer -= dt;
+  const dbg = dbgTimer <= 0 ? $('debug-info') : null; // Se actualiza 4 veces por segundo, no en cada cuadro
   if (dbg) {
+    dbgTimer = 0.25;
     dbg.innerHTML =
       `X:${playerPos.x.toFixed(1)} Z:${playerPos.z.toFixed(1)}<br>` +
       `Yaw:${(camYaw * 180 / Math.PI).toFixed(0)}° Pitch:${(camPitch * 180 / Math.PI).toFixed(0)}°<br>` +
+      `${perfFps ? perfFps.toFixed(0) + ' FPS · res ' + perfRatio.toFixed(2) + '<br>' : ''}` +
       `${gs}`;
   }
 
@@ -3724,6 +3778,24 @@ function animate() {
 // §16 · INICIALIZACIÓN — Punto de entrada
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Los objetos bajos del pabellón no necesitan proyectar sombra: el techo ya tapa el sol y las
+ * luces del techo no proyectan sombras. Quitarlos de las pasadas de sombra ahorra muchos
+ * dibujos por cuadro sin cambiar lo que se ve (se mantienen los muros, rejas, techo y personajes).
+ */
+function pruneInteriorShadowCasters() {
+  const box = new THREE.Box3();
+  let pruned = 0;
+  scene.updateMatrixWorld(true);
+  scene.traverse(o => {
+    if (!o.isMesh || !o.castShadow || o.isSkinnedMesh || o.isInstancedMesh) return;
+    box.setFromObject(o);
+    if (box.isEmpty()) return;
+    if (box.min.z > BLOCK.zN + 0.3 && box.max.y < BLOCK.H - 0.6) { o.castShadow = false; pruned++; }
+  });
+  console.log(`[PrisonEscape] Sombras interiores quitadas en ${pruned} mallas`);
+}
+
 async function init() {
   setupThree();
   buildEnvironment();
@@ -3738,6 +3810,14 @@ async function init() {
 
   try {
     await loadAllModels();
+    pruneInteriorShadowCasters();
+    // Compila todos los shaders ahora, detrás de la pantalla de carga: si no, cada material se
+    // compila la primera vez que aparece en cámara y produce trabas al girar o cambiar de zona
+    try {
+      renderer.shadowMap.needsUpdate = true;
+      if (renderer.compileAsync) await renderer.compileAsync(scene, camera);
+      else renderer.compile(scene, camera);
+    } catch (e) { console.warn('[PrisonEscape] No se pudo precompilar los shaders', e); }
     // La barra tiene una transición CSS; esperar a que llegue visualmente al 100%.
     await new Promise(resolve => setTimeout(resolve, 450));
     $('loading-screen').style.display = 'none';
